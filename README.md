@@ -35,7 +35,7 @@
 
 ```bash
 cd /path/to/MaiBot/plugins
-git clone <本仓库地址> MaiBot-IIROSE-Adapter
+git clone https://github.com/TYC3301-1162-1/Maibot-For-iirose-Adapter-Demo MaiBot-IIROSE-Adapter
 ```
 
 也可以在 WebUI 的「插件管理」里从插件市场安装，或直接把本目录整个复制到 `plugins/` 下。
