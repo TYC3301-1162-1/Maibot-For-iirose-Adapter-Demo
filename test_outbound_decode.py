@@ -18,6 +18,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import time
@@ -96,9 +97,12 @@ def _plugin(data_dir=None) -> adapter.IIRoseAdapterPlugin:
     config.image_host.token = "test-token"
     config.image_host.reuse_uploaded = True
     config.chat_list.enabled = False
+    config.chat_list.user_list_enabled = False
     config.chat_list.user_list_type = "whitelist"
     config.chat_list.user_list = []
+    config.chat_list.ban_user_enabled = False
     config.chat_list.ban_user_list = []
+    config.chat_list.room_list_enabled = False
     config.chat_list.room_list_type = "blacklist"
     config.chat_list.room_list = []
     config.chat_list.log_dropped = False
@@ -155,13 +159,13 @@ CASES = [
                                          "target_user_nickname": "Es."}},
                   {"type": "text", "data": " 在吗"}],
                  group_id="64d5f8e17b2ad"),
-        "[*Es.*]  在吗", "room", "64d5f8e17b2ad",
+        " [*Es.*]  在吗", "room", "64d5f8e17b2ad",
     ),
     (
         "at 只有 uid 且目录里查不到 → 兜底保留 uid",
         _message([{"type": "at", "data": {"target_user_id": "0000000000000"}}],
                  group_id="64d5f8e17b2ad"),
-        "[@0000000000000@]", "room", "64d5f8e17b2ad",
+        " [@0000000000000@] ", "room", "64d5f8e17b2ad",
     ),
     (
         "图片 URL 转成 IIROSE 图片语法 [url#e]",
@@ -190,19 +194,19 @@ CASES = [
         "顶层正文", "private", "u9",
     ),
     (
-        "引用组件：从近期消息缓存还原成 `旧内容 (_hr) 发送者_时间戳秒 (hr_) 新内容`",
+        "引用组件：从近期缓存还原成 `旧内容 (_hr) 发送者_时间戳秒 (hr_) 新内容`",
         _message([{"type": "reply", "data": {"target_message_id": "760771550794"}},
                   {"type": "text", "data": "我记得的"}],
                  group_id="64d5f8e17b2ad"),
         "图床修好啦 (_hr) Es._1789213830 (hr_) 我记得的", "room", "64d5f8e17b2ad",
     ),
     (
-        "引用目标不在缓存：退回组件自带昵称",
+        "引用目标不在缓存：拿不到时间戳就不发引用（不拿消息 id 冒充时间戳）",
         _message([{"type": "reply", "data": {"target_message_id": "999",
                                              "target_user_nickname": "柒洛"}},
                   {"type": "text", "data": "嗯嗯"}],
                  group_id="64d5f8e17b2ad"),
-        "(_hr) 柒洛_999 (hr_) 嗯嗯", "room", "64d5f8e17b2ad",
+        "嗯嗯", "room", "64d5f8e17b2ad",
     ),
     (
         "引用目标完全无法还原：降级为普通文本，不吐畸形的引用标记",
@@ -216,7 +220,16 @@ CASES = [
         _message([{"type": "at", "data": {"target_user_id": "65abb7a99dc60"}},
                   {"type": "text", "data": " 在吗"}],
                  group_id="64d5f8e17b2ad"),
-        "[*柒洛*]  在吗", "room", "64d5f8e17b2ad",
+        " [*柒洛*]  在吗", "room", "64d5f8e17b2ad",
+    ),
+    (
+        "at 同时带群名片/备注时，仍用本地用户名（群名片不是登录名，@ 会失效）",
+        _message([{"type": "at", "data": {"target_user_id": "65abb7a99dc60",
+                                          "target_user_cardname": "群里的外号",
+                                          "target_user_nickname": "群里的小名"}},
+                  {"type": "text", "data": " 在吗"}],
+                 group_id="64d5f8e17b2ad"),
+        " [*柒洛*]  在吗", "room", "64d5f8e17b2ad",
     ),
     (
         "私聊目标来自 additional_config.platform_io_target_user_id",
@@ -260,6 +273,7 @@ def _legacy_extract_text(message) -> str:
 class _FakeClient:
     def __init__(self) -> None:
         self.sent: list[str] = []
+        self.closed = False
 
     @property
     def connected(self) -> bool:
@@ -267,6 +281,9 @@ class _FakeClient:
 
     async def send(self, text: str) -> None:
         self.sent.append(text)
+
+    async def close(self) -> None:
+        self.closed = True
 
 
 async def _check_gateway(start_index: int) -> int:
@@ -460,9 +477,10 @@ async def _check_member_events(start_index: int) -> int:
         payload = payloads[0]
         if payload.get("is_notify") is not True:
             problems.append(f"is_notify={payload.get('is_notify')!r}")
-        if payload.get("display_message") != "柒洛 重新连接进入房间":
+        if payload.get("display_message") != "柒洛 重新连接进入房间 → 64d5f8e17b2ad":
             problems.append(f"display_message={payload.get('display_message')!r}")
-        if payload.get("raw_message") != [{"type": "text", "data": "柒洛 重新连接进入房间"}]:
+        if payload.get("raw_message") != [
+                {"type": "text", "data": "柒洛 重新连接进入房间 → 64d5f8e17b2ad"}]:
             problems.append(f"raw_message={payload.get('raw_message')!r}")
         group = payload.get("message_info", {}).get("group_info", {})
         if group.get("group_id") != "64d5f8e17b2ad":
@@ -603,6 +621,21 @@ async def _check_inbound(start_index: int) -> int:
     report(start_index + 6, "引用部分去 @、新正文保留 @（只剥引用块）", problems,
            json.dumps(components, ensure_ascii=False))
 
+    # 7b) 消息 id 带 `<` 的消息不能被丢掉
+    #     实测：`411952792881<1789271137`（客户端 id + 服务器时间戳）被原来的 isalnum() 检查误杀
+    instance = _plugin()
+    kind, weird = adapter.parse_frame(_room_frame(
+        " [*03酱*] 你好", message_id="411952792881<1789271137"))
+    await instance._dispatch_inbound(kind, weird)
+    problems = []
+    payloads = instance.ctx.gateway.payloads  # type: ignore[attr-defined]
+    if len(payloads) != 1:
+        problems.append(f"带 `<` 的消息 id 被丢掉了（投递 {len(payloads)} 条）")
+    elif payloads[0].get("message_id") != "411952792881<1789271137":
+        problems.append(f"message_id={payloads[0].get('message_id')!r}")
+    report(start_index + 7, "消息 id 带 `<`（客户端id<服务器时间戳）不再被丢弃", problems,
+           f"投递 {len(payloads)} 条")
+
     # 8) 图片内容 `[url#e]` 交给麦麦前要还原成裸 URL（实测别人发图就是这个形态）
     instance = _plugin()
     kind, img_msg = adapter.parse_frame(
@@ -738,6 +771,26 @@ async def _check_media_card(start_index: int) -> int:
         if parsed is not None:
             problems.append(f"{why} 被误判为卡片: {bad!r} → {parsed!r}")
     report(start_index + 5, "残缺 / 非法前缀的文本不误判为卡片", problems, "3 种反例")
+
+    # 7) 带封面变体前缀（% / # / !）也要能识别
+    problems = []
+    variants = [
+        ("m__4%2>晴天>周杰伦>http://r.iirose.com/i/d.jpg>66ccff>128", "QQ音乐", False),
+        ("m__4#3>B站视频>UP主>http://r.iirose.com/i/e.jpg>66ccff>128", "B站", True),
+        ("m__4!3>B站视频>UP主>http://r.iirose.com/i/f.jpg>66ccff>128", "B站", True),
+    ]
+    details = []
+    for raw_card, want_platform, want_video in variants:
+        card = adapter.parse_media_card(raw_card)
+        details.append(f"{raw_card[4:6]}→{card.get('platform') if card else None}")
+        if card is None:
+            problems.append(f"{raw_card[:8]} 没被识别成卡片")
+            continue
+        if card.get("platform") != want_platform or card.get("is_video") is not want_video:
+            problems.append(f"{raw_card[:8]}: platform={card.get('platform')!r} "
+                            f"is_video={card.get('is_video')!r}")
+    report(start_index + 6, "卡片变体前缀（`%` 音乐带封面 / `#`、`!` 视频带封面）", problems,
+           " ".join(details))
 
     return failures
 
@@ -1038,9 +1091,28 @@ async def _check_image_host(start_index: int) -> int:
     return failures
 
 
+def _set_chat_list(**kwargs) -> None:
+    """显式设置名单状态（配置对象是共享的，每次都要重置干净）。"""
+    chat = adapter.IIRoseAdapterPlugin.config.chat_list
+    chat.enabled = kwargs.get("enabled", False)
+    chat.user_list_enabled = kwargs.get("user_list_enabled", False)
+    chat.user_list_type = kwargs.get("user_list_type", "whitelist")
+    chat.user_list = list(kwargs.get("user_list", []))
+    chat.ban_user_enabled = kwargs.get("ban_user_enabled", False)
+    chat.ban_user_list = list(kwargs.get("ban_user_list", []))
+    chat.room_list_enabled = kwargs.get("room_list_enabled", False)
+    chat.room_list_type = kwargs.get("room_list_type", "blacklist")
+    chat.room_list = list(kwargs.get("room_list", []))
+    chat.log_dropped = False
+
+
 async def _check_chat_list(start_index: int) -> int:
-    """黑白名单过滤（语义对齐官方 NapCat 适配器 filters.py）。"""
+    """黑白名单过滤：三个名单独立开关，互不影响。"""
     failures = 0
+    UID = "6649f1377e8c7"
+    NAME = "柒月依"
+    ROOM = "64d5f8e17b2ad"
+    OTHER_UID = "0000000000000"
 
     def report(index: int, name: str, problems: list[str], detail: str = "") -> None:
         nonlocal failures
@@ -1050,81 +1122,175 @@ async def _check_chat_list(start_index: int) -> int:
         for problem in problems:
             print(f"        {problem}")
 
-    UID = "6649f1377e8c7"
-    NAME = "柒月依"
+    # 注意：_plugin() 会把配置重置为默认值，所以先建实例、再逐个改配置
+    instance = _plugin()
 
-    def decide(case: str) -> tuple[bool, str]:
-        instance = _plugin()
-        chat = adapter.IIRoseAdapterPlugin.config.chat_list
-        if case == "disabled":
-            chat.enabled = False
-        elif case == "whitelist_hit":
-            chat.enabled, chat.user_list_type, chat.user_list = True, "whitelist", [UID]
-        elif case == "whitelist_name_hit":
-            chat.enabled, chat.user_list_type, chat.user_list = True, "whitelist", [NAME]
-        elif case == "whitelist_miss":
-            chat.enabled, chat.user_list_type, chat.user_list = True, "whitelist", ["another-uid"]
-        elif case == "whitelist_empty":
-            chat.enabled, chat.user_list_type, chat.user_list = True, "whitelist", []
-        elif case == "blacklist_hit":
-            chat.enabled, chat.user_list_type, chat.user_list = True, "blacklist", [UID]
-        elif case == "blacklist_miss":
-            chat.enabled, chat.user_list_type, chat.user_list = True, "blacklist", ["another-uid"]
-        elif case == "banned":
-            chat.enabled, chat.ban_user_list = False, [UID]
-        elif case == "banned_overrides_whitelist":
-            chat.enabled, chat.user_list_type, chat.user_list = True, "whitelist", [UID]
-            chat.ban_user_list = [UID]
-        return instance._chat_list_check("room", UID, NAME, "64d5f8e17b2ad")
+    def decide(user_id: str = UID, user_name: str = NAME, room: str = ROOM) -> tuple[bool, str]:
+        return instance._chat_list_check("room", user_id, user_name, room)
 
     cases = [
-        ("disabled", True, "未启用时全部放行"),
-        ("whitelist_hit", True, "白名单命中 UID"),
-        ("whitelist_name_hit", True, "白名单命中用户名（兜底）"),
-        ("whitelist_miss", False, "白名单未命中 → 拦截"),
-        ("whitelist_empty", False, "白名单为空 → 全部拦截"),
-        ("blacklist_hit", False, "黑名单命中 → 拦截"),
-        ("blacklist_miss", True, "黑名单未命中 → 放行"),
-        ("banned", False, "永久屏蔽名单：即使名单过滤未启用也拦截"),
-        ("banned_overrides_whitelist", False, "永久屏蔽优先于白名单"),
+        # (说明, 配置, 期望放行)
+        ("总开关关闭：三个名单都不生效（即使子开关全开）",
+         dict(enabled=False, user_list_enabled=True, user_list=["别人"],
+              ban_user_enabled=True, ban_user_list=[UID],
+              room_list_enabled=True, room_list_type="whitelist", room_list=[]), True),
+        ("总开关开 + 用户名单开关关 → 不看用户名单",
+         dict(enabled=True, user_list_enabled=False, user_list=["别人"]), True),
+        ("用户白名单命中 UID", dict(enabled=True, user_list_enabled=True, user_list=[UID]), True),
+        ("用户白名单命中用户名（兜底）", dict(enabled=True, user_list_enabled=True, user_list=[NAME]), True),
+        ("用户白名单未命中 → 拦截",
+         dict(enabled=True, user_list_enabled=True, user_list=[OTHER_UID]), False),
+        ("用户白名单为空 → 放行（不再全员拦截）",
+         dict(enabled=True, user_list_enabled=True, user_list=[]), True),
+        ("用户黑名单命中 → 拦截",
+         dict(enabled=True, user_list_enabled=True, user_list_type="blacklist",
+              user_list=[UID]), False),
+        ("用户黑名单未命中 → 放行",
+         dict(enabled=True, user_list_enabled=True, user_list_type="blacklist",
+              user_list=[OTHER_UID]), True),
+        ("永久屏蔽开关关 → 名单里有也不拦",
+         dict(enabled=True, ban_user_enabled=False, ban_user_list=[UID]), True),
+        ("永久屏蔽开关开 + 命中 → 拦截",
+         dict(enabled=True, ban_user_enabled=True, ban_user_list=[UID]), False),
+        ("永久屏蔽优先于用户白名单",
+         dict(enabled=True, ban_user_enabled=True, ban_user_list=[NAME],
+              user_list_enabled=True, user_list=[UID]), False),
+        ("房间名单开关开但名单为空 → 放行",
+         dict(enabled=True, room_list_enabled=True, room_list_type="whitelist", room_list=[]),
+         True),
+        ("房间白名单命中 → 放行",
+         dict(enabled=True, room_list_enabled=True, room_list_type="whitelist", room_list=[ROOM]),
+         True),
+        ("房间白名单未命中 → 拦截",
+         dict(enabled=True, room_list_enabled=True, room_list_type="whitelist",
+              room_list=["5b7ab80a2017d"]), False),
+        ("房间黑名单命中 → 拦截",
+         dict(enabled=True, room_list_enabled=True, room_list_type="blacklist",
+              room_list=[ROOM]), False),
+        ("只开房间名单不影响用户维度（黑名单里的人在别的房间照常放行）",
+         dict(enabled=True, room_list_enabled=True, room_list_type="blacklist", room_list=[ROOM],
+              user_list_enabled=False, user_list_type="blacklist", user_list=[UID]), False),
     ]
     problems = []
-    details = []
-    for case, want, why in cases:
-        got, reason = decide(case)
-        details.append(f"{case}={got}")
+    for why, config, want in cases:
+        _set_chat_list(**config)
+        got, reason = decide()
         if got is not want:
-            problems.append(f"{why}：期望 {want}，实际 {got}（{reason}）")
-    report(start_index, "名单判定：白/黑名单、用户名兜底、空名单、永久屏蔽", problems,
-           f"{len(cases)} 种情形")
+            problems.append(f"{why}：期望 {'放行' if want else '拦截'}，实际 {got}（{reason}）")
+    report(start_index, "三个名单独立开关 + 空名单不再误拦", problems, f"{len(cases)} 种情形")
 
-    # 被拦截的消息绝不能投递给麦麦
+    # 被拦截的消息绝不能投递给麦麦；独立开关要真的生效
+    # （实例先建好，_set_chat_list 只改共享配置，不重新构造实例）
     problems = []
-    instance = _plugin()
-    chat = adapter.IIRoseAdapterPlugin.config.chat_list
-    chat.enabled, chat.user_list_type, chat.user_list = True, "blacklist", [UID]
     kind, msg = adapter.parse_frame(
         _room_frame("你好呀", message_id="800000000001", user_id=UID, user_name=NAME))
+
+    _set_chat_list(enabled=True, user_list_enabled=True, user_list_type="blacklist", user_list=[UID])
+    instance.ctx.gateway.payloads.clear()  # type: ignore[attr-defined]
     await instance._dispatch_inbound(kind, msg)
-    if instance.ctx.gateway.payloads:  # type: ignore[attr-defined]
-        problems.append(f"黑名单用户的消息被投递了：{instance.ctx.gateway.payloads!r}")  # type: ignore[attr-defined]
+    blocked_count = len(instance.ctx.gateway.payloads)  # type: ignore[attr-defined]
+    if blocked_count:
+        problems.append(f"用户黑名单里的消息被投递了（{blocked_count} 条）")
 
-    # 同时确认白名单放行的人仍然正常投递（避免过滤把所有人都拦了）
-    chat.user_list_type, chat.user_list = "whitelist", [UID]
-    instance2 = _plugin()
-    adapter.IIRoseAdapterPlugin.config.chat_list.enabled = True
-    adapter.IIRoseAdapterPlugin.config.chat_list.user_list_type = "whitelist"
-    adapter.IIRoseAdapterPlugin.config.chat_list.user_list = [UID]
-    await instance2._dispatch_inbound(kind, msg)
-    if len(instance2.ctx.gateway.payloads) != 1:  # type: ignore[attr-defined]
-        problems.append("白名单内的用户消息没有投递")
-    report(start_index + 1, "拦截发生在投递给麦麦之前", problems,
-           f"黑名单投递 {len(instance.ctx.gateway.payloads)} 条 / 白名单投递 "  # type: ignore[attr-defined]
-           f"{len(instance2.ctx.gateway.payloads)} 条")  # type: ignore[attr-defined]
+    _set_chat_list(enabled=True, user_list_enabled=True, user_list_type="whitelist", user_list=[UID])
+    instance.ctx.gateway.payloads.clear()  # type: ignore[attr-defined]
+    await instance._dispatch_inbound(kind, msg)
+    allowed_count = len(instance.ctx.gateway.payloads)  # type: ignore[attr-defined]
+    if allowed_count != 1:
+        problems.append(f"用户白名单内的消息没有投递（{allowed_count} 条）")
 
-    adapter.IIRoseAdapterPlugin.config.chat_list.enabled = False
-    adapter.IIRoseAdapterPlugin.config.chat_list.ban_user_list = []
-    adapter.IIRoseAdapterPlugin.config.chat_list.user_list = []
+    # 名单开关关掉后，同一个人立刻恢复
+    _set_chat_list(enabled=True, user_list_enabled=False, user_list_type="whitelist",
+                   user_list=[UID])
+    instance.ctx.gateway.payloads.clear()  # type: ignore[attr-defined]
+    await instance._dispatch_inbound(kind, msg)
+    reopened_count = len(instance.ctx.gateway.payloads)  # type: ignore[attr-defined]
+    if reopened_count != 1:
+        problems.append(f"关掉用户名单开关后消息仍未投递（{reopened_count} 条）")
+
+    report(start_index + 1, "拦截发生在投递给麦麦之前，且开关实时生效", problems,
+           f"黑名单 {blocked_count} 条 / 白名单 {allowed_count} 条 / 关开关后 {reopened_count} 条")
+
+    _set_chat_list()
+    return failures
+
+
+async def _check_room_change(start_index: int) -> int:
+    """配置改房间号 → 实时切房（发 m 指令 + 带 lr 重连进新房间）。"""
+    failures = 0
+    OLD_ROOM = "64d5f8e17b2ad"
+    NEW_ROOM = "5b7ab80a2017d"
+
+    def report(index: int, name: str, problems: list[str], detail: str = "") -> None:
+        nonlocal failures
+        if problems:
+            failures += 1
+        print(f"[{'PASS' if problems else 'FAIL'}] {index}. {name}" if problems
+              else f"[PASS] {index}. {name}{(' → ' + detail) if detail else ''}")
+        for problem in problems:
+            print(f"        {problem}")
+
+    # 1) 切房相关回包要能被识别
+    cases = [("m6547d48b60b2b", "room_move"), ("m!5", "room_move"),
+             ("`~1", "room_password"), ("`~0", "room_password")]
+    problems = []
+    details = []
+    for frame, want in cases:
+        kind, _ = adapter.parse_frame(frame)
+        details.append(f"{frame}={kind}")
+        if kind != want:
+            problems.append(f"{frame!r} → {kind!r} 期望 {want!r}")
+    report(start_index, "识别服务端切房确认（`m` / `m!5`）与密码校验（`` `~ ``）", problems,
+           " ".join(details))
+
+    # 2) 切房后的登录包必须带 lr（原房间 id）
+    problems = []
+    payload = json.loads(adapter.build_login(
+        NEW_ROOM, "03酱", "pw", last_room_id=OLD_ROOM)[1:])
+    if payload.get("r") != NEW_ROOM:
+        problems.append(f"r={payload.get('r')!r}")
+    if payload.get("lr") != OLD_ROOM:
+        problems.append(f"lr={payload.get('lr')!r} 期望 {OLD_ROOM!r}")
+    plain = json.loads(adapter.build_login(NEW_ROOM, "03酱", "pw")[1:])
+    if "lr" in plain:
+        problems.append("没有切房时不该带 lr")
+    report(start_index + 1, "切房重连的登录包带 lr（原房间 id）", problems,
+           f"r={payload.get('r')} lr={payload.get('lr')}")
+
+    # 3) 改房间号 → 发切房指令，并记下原房间用于重连
+    original_settle = adapter.MOVE_ROOM_SETTLE_SECONDS
+    adapter.MOVE_ROOM_SETTLE_SECONDS = 0.01
+    try:
+        instance = _plugin()
+        adapter.IIRoseAdapterPlugin.config.plugin.enabled = False   # 只验证切房，不真的建连接
+        fake = _FakeClient()                                        # connected 固定返回 True
+        instance._client = fake                                      # type: ignore[attr-defined]
+        instance._active_room_id = OLD_ROOM                          # type: ignore[attr-defined]
+        adapter.IIRoseAdapterPlugin.config.account.room_id = NEW_ROOM
+        await instance._restart_connection_if_needed()
+        problems = []
+        if fake.sent != [f"m{NEW_ROOM}"]:
+            problems.append(f"切房指令={fake.sent!r} 期望 ['m{NEW_ROOM}']")
+        if instance._last_room_id != OLD_ROOM:                       # type: ignore[attr-defined]
+            problems.append(f"未记录原房间: {instance._last_room_id!r}")  # type: ignore[attr-defined]
+        report(start_index + 2, "改房间号 → 立即发 `m<新房间>` 并准备带 lr 重连", problems,
+               f"sent={fake.sent!r} last_room={instance._last_room_id!r}")  # type: ignore[attr-defined]
+
+        # 4) 房间号没变 → 不发切房指令
+        instance = _plugin()
+        adapter.IIRoseAdapterPlugin.config.plugin.enabled = False
+        fake = _FakeClient()                                        # connected 固定返回 True
+        instance._client = fake                                      # type: ignore[attr-defined]
+        instance._active_room_id = OLD_ROOM                          # type: ignore[attr-defined]
+        adapter.IIRoseAdapterPlugin.config.account.room_id = OLD_ROOM
+        await instance._restart_connection_if_needed()
+        problems = [] if not fake.sent else [f"房间没变却发了切房指令: {fake.sent!r}"]
+        report(start_index + 3, "房间号未变化时不发切房指令", problems)
+    finally:
+        adapter.MOVE_ROOM_SETTLE_SECONDS = original_settle
+        adapter.IIRoseAdapterPlugin.config.plugin.enabled = True
+        adapter.IIRoseAdapterPlugin.config.account.room_id = "64d5f8e17b2ad"
+
     return failures
 
 
@@ -1132,12 +1298,78 @@ class _FakeWS:
     def __init__(self) -> None:
         self.closed = False
         self.sent: list[bytes] = []
+        self.close_args: tuple = ()
 
-    async def close(self) -> None:
+    async def close(self, *args: object) -> None:
         self.closed = True
+        self.close_args = args
 
     async def send(self, data: bytes) -> None:
         self.sent.append(data)
+
+
+async def _check_shutdown(start_index: int) -> int:
+    """插件停用 / 重载时必须真正关掉 WebSocket（IIROSE 靠断线判定下线）。"""
+    failures = 0
+    logger = logging.getLogger("iirose-test")
+
+    def report(index: int, name: str, problems: list[str], detail: str = "") -> None:
+        nonlocal failures
+        if problems:
+            failures += 1
+        print(f"[{'PASS' if not problems else 'FAIL'}] {index}. {name}{(' → ' + detail) if detail else ''}")
+        for problem in problems:
+            print(f"        {problem}")
+
+    # 1) run() 收尾会把 _ws 置空；close() 仍然必须关掉真正的 socket
+    problems = []
+    client = adapter.IIRoseClient(lambda t: asyncio.sleep(0), logger=logger)
+    fake = _FakeWS()
+    client._socket_to_close = fake
+    client._ws = None                      # 模拟 run() 的 finally 已经执行过
+    await client.close()
+    if not fake.closed:
+        problems.append("close() 没有关闭 socket（插件停用后服务端会以为还在线）")
+    if fake.close_args[:1] != (1000,):
+        problems.append(f"关闭码不是 1000（优雅关闭）: {fake.close_args!r}")
+    report(start_index, "close() 即使 _ws 已清空也真正关闭连接（关闭码 1000）", problems,
+           f"closed={fake.closed} args={fake.close_args}")
+
+    # 2) _stop_connection：先关 socket 再收尾任务，顺序不能反
+    problems = []
+    instance = _plugin()
+    order: list[str] = []
+
+    class _OrderedClient(_FakeClient):
+        async def close(self) -> None:
+            order.append("close")
+            self.closed = True
+
+    fake_client = _OrderedClient()
+
+    async def long_running() -> None:
+        try:
+            await asyncio.sleep(3600)
+        finally:
+            # 模拟 IIRoseClient.run() 的 finally：收尾时才清空 socket 引用
+            order.append("task-finalized")
+
+    instance._client = fake_client                                  # type: ignore[attr-defined]
+    instance._task = asyncio.create_task(long_running())            # type: ignore[attr-defined]
+    await asyncio.sleep(0)      # 让任务真正开始执行，否则取消时它的 finally 不会跑
+    await instance._stop_connection()
+    if "close" not in order:
+        problems.append("_stop_connection 没有调用 client.close()")
+    elif "task-finalized" not in order:
+        problems.append(f"任务收尾没执行: {order}")
+    elif order.index("close") > order.index("task-finalized"):
+        problems.append(f"关闭发生得太晚（顺序反了）: {order}")
+    if instance._task is not None:                                  # type: ignore[attr-defined]
+        problems.append("连接任务没有被清理")
+    report(start_index + 1, "_stop_connection 先关 socket、再收尾任务（顺序正确）", problems,
+           " → ".join(order) or "无")
+
+    return failures
 
 
 async def _check_connection(start_index: int) -> int:
@@ -1249,6 +1481,341 @@ def distinct(values: list) -> str:
     return " → ".join(f"{v:.0f}" for v in values[:3] + values[-2:])
 
 
+async def _check_room_names(start_index: int) -> int:
+    """房间名：从 `%` 大包解析房间目录，并用于会话名 / 成员事件 / @房间。"""
+    failures = 0
+
+    def report(index: int, name: str, problems: list[str], detail: str = "") -> None:
+        nonlocal failures
+        if problems:
+            failures += 1
+        print(f"[{'PASS' if not problems else 'FAIL'}] {index}. {name}{(' → ' + detail) if detail else ''}")
+        for problem in problems:
+            print(f"        {problem}")
+
+    # 真实 `%` 大包片段：含用户记录（[0] 是头像路径）和房间记录（[0] 是房间号）
+    init_payload = (
+        "scenery/500584>0>基站>000000>5b792977089e7>n>>>53f9aabd9987c>>>a>4>32187>0>8,45.8,0.5>"
+        "<'5b792cb650749_6a4a56d0b4ca7>存在放映社 | MeowTV>4,88,58>2003>>://r.iirose.com/i/x.jpg "
+        "20：00 《饮食男女》&&1&&"
+        "<64d5f8e17b2ad>云端小屋>3,12,4>37>>://r.iirose.com/i/y.jpg 欢迎光临&&2&&"
+        "\"第二个段：当前房间在线用户"
+    )
+
+    # 1) 房间目录解析
+    directory = adapter.parse_room_directory(init_payload)
+    problems = []
+    for room_id, name in ({"64d5f8e17b2ad": "云端小屋",
+                           "5b792cb650749": "存在放映社",
+                           "6a4a56d0b4ca7": "MeowTV"}).items():
+        if directory.get(room_id) != name:
+            problems.append(f"{room_id} → {directory.get(room_id)!r} 期望 {name!r}")
+    if "scenery/500584" in directory:
+        problems.append("用户记录（[0] 是头像路径）被误判成房间")
+    report(start_index, "从 `%` 大包解析房间目录（双房 `a_b` 也拆开）", problems,
+           f"{len(directory)} 个房间")
+
+    # 2) `_room_name` / `_describe_room`
+    instance = _plugin()
+    instance._room_names.update(directory)
+    problems = []
+    if instance._room_name("64d5f8e17b2ad") != "云端小屋":
+        problems.append(f"_room_name 查不到: {instance._room_name('64d5f8e17b2ad')!r}")
+    if instance._describe_room("64d5f8e17b2ad") != "云端小屋 (64d5f8e17b2ad)":
+        problems.append(f"_describe_room={instance._describe_room('64d5f8e17b2ad')!r}")
+    if instance._describe_room("fffffffffffff") != "fffffffffffff":
+        problems.append("未知房间应回退成房间号")
+    report(start_index + 1, "房间号 → 房间名的查表与展示格式", problems,
+           instance._describe_room("64d5f8e17b2ad"))
+
+    # 3) 会话信息里的 group_name 必须是房间名（后台聊天列表读的就是它）
+    instance = _plugin()
+    instance._room_names.update(directory)
+    kind, msg = adapter.parse_frame(_room_frame("你好呀", message_id="900000000001"))
+    instance.ctx.gateway.payloads.clear()  # type: ignore[attr-defined]
+    await instance._dispatch_inbound(kind, msg)
+    payload = instance.ctx.gateway.payloads[-1]  # type: ignore[attr-defined]
+    group = payload["message_info"].get("group_info", {})
+    problems = []
+    if group.get("group_name") != "云端小屋":
+        problems.append(f"group_name={group.get('group_name')!r}，应为房间名「云端小屋」")
+    if group.get("group_id") != "64d5f8e17b2ad":
+        problems.append(f"group_id={group.get('group_id')!r}")
+    report(start_index + 2, "群聊会话名用真实房间名（不再只有房间号）", problems,
+           f"group_info={group}")
+
+    # 4) 成员换房事件要带上目标房间名
+    instance = _plugin()
+    instance._room_names.update(directory)
+    kind, event = adapter.parse_frame(
+        _member_frame(["1789213840", _AVATAR, "柒洛", "'25b792cb650749", "bd8b96", "bd8b96",
+                       "2", "", _UID, "'108", "64d5f8e17b2ad", "35b792cb650749"]))
+    instance.ctx.gateway.payloads.clear()  # type: ignore[attr-defined]
+    await instance._handle_member_event(event)
+    payload = instance.ctx.gateway.payloads[-1]  # type: ignore[attr-defined]
+    text = payload.get("display_message", "")
+    problems = []
+    if "存在放映社" not in text or "5b792cb650749" not in text:
+        problems.append(f"换房文案缺少目标房间名/房间号: {text!r}")
+    notice_group = payload["message_info"].get("group_info", {})
+    if notice_group.get("group_name") != "云端小屋":
+        problems.append(f"通知的 group_name={notice_group.get('group_name')!r}")
+    report(start_index + 3, "成员换房文案带目标房间名与房间号", problems, repr(text))
+
+    return failures
+
+
+async def _check_at(start_index: int) -> int:
+    """@ 相关：配置包裹语法剥离、@房间渲染成房间名。"""
+    failures = 0
+
+    def report(index: int, name: str, problems: list[str], detail: str = "") -> None:
+        nonlocal failures
+        if problems:
+            failures += 1
+        print(f"[{'PASS' if not problems else 'FAIL'}] {index}. {name}{(' → ' + detail) if detail else ''}")
+        for problem in problems:
+            print(f"        {problem}")
+
+    # 1) 配置里的包裹语法必须被剥离（官方 adapter 的配置说明就是这么写的）
+    cases = [
+        ("[*03酱*]", adapter.normalize_username, "03酱"),
+        ("  03酱  ", adapter.normalize_username, "03酱"),
+        ("03酱", adapter.normalize_username, "03酱"),
+        ("[@62B98115CEFD2@]", adapter.normalize_uid, "62b98115cefd2"),
+        ("62B98115CEFD2", adapter.normalize_uid, "62b98115cefd2"),
+        ("[_64D5F8E17B2AD_]", adapter.normalize_room_id, "64D5F8E17B2AD"),
+        ("64d5f8e17b2ad", adapter.normalize_room_id, "64d5f8e17b2ad"),
+    ]
+    problems = []
+    for raw, func, want in cases:
+        got = func(raw)
+        if got != want:
+            problems.append(f"{func.__name__}({raw!r}) = {got!r} 期望 {want!r}")
+    report(start_index, "剥离 `[*名字*]` / `[@uid@]` / `[_房间id_]` 包裹语法", problems,
+           f"{len(cases)} 种写法")
+
+    # 2) 填了带括号的用户名时，机器人仍然要认出「被 @ 的是自己」
+    problems = []
+    instance = _plugin()
+    adapter.IIRoseAdapterPlugin.config.account.username = "[*03酱*]"
+    adapter.IIRoseAdapterPlugin.config.account.uid = "[@62b98115cefd2@]"
+    components = instance._build_components(
+        " [*03酱*]  你好", self_uid=instance._self_uid, self_name=instance._username)
+    ats = [c for c in components if c.get("type") == "at"]
+    if len(ats) != 1:
+        problems.append(f"at 组件数={len(ats)}：{components!r}")
+    else:
+        if ats[0]["data"].get("target_user_id") != "62b98115cefd2":
+            problems.append(f"target_user_id={ats[0]['data'].get('target_user_id')!r}"
+                            "（应归一化为 uid）")
+        if ats[0]["data"].get("target_user_nickname") != "03酱":
+            problems.append(f"nickname={ats[0]['data'].get('target_user_nickname')!r}")
+    report(start_index + 1, "配置填 `[*名字*]` / `[@uid@]` 也能认出「我被 @ 了」", problems,
+           json.dumps(components, ensure_ascii=False))
+    adapter.IIRoseAdapterPlugin.config.account.username = "03酱"
+    adapter.IIRoseAdapterPlugin.config.account.uid = "62b98115cefd2"
+
+    # 3) `[_房间id_]` 渲染成房间名（官方把它当 sharp，Host 没这个概念）
+    problems = []
+    instance = _plugin()
+    instance._room_names["5b792cb650749"] = "存在放映社"
+    components = instance._build_components(
+        "[_5b792cb650749_] 大家来这边", self_uid="62b98115cefd2", self_name="03酱")
+    visible = "".join(c.get("data", "") for c in components if c.get("type") == "text")
+    if "存在放映社" not in visible:
+        problems.append(f"@房间没渲染成房间名: {visible!r}")
+    if any(c.get("type") == "at" for c in components):
+        problems.append("`[_房间id_]` 不该产生 at 组件")
+    report(start_index + 2, "`[_房间id_]`（官方 sharp）渲染成房间名，不当作 @ 人", problems,
+           repr(visible))
+
+    # 4) 用户名里带空格 / 特殊字符也要能解析（官方用 `[\s\S]+?`，不限制字符集）
+    problems = []
+    instance = _plugin()
+    instance._remember("", user_id="aaaa1111bbbb2", user_name="比企谷 八幡", timestamp=0, text="")
+    components = instance._build_components(
+        " [*比企谷 八幡*]  早", self_uid="62b98115cefd2", self_name="03酱")
+    ats = [c for c in components if c.get("type") == "at"]
+    if len(ats) != 1 or ats[0]["data"].get("target_user_id") != "aaaa1111bbbb2":
+        problems.append(f"带空格的用户名解析失败：{components!r}")
+    report(start_index + 3, "用户名含空格等字符也能解析（对齐官方正则）", problems,
+           json.dumps(components, ensure_ascii=False))
+
+    # 5) 出站 @ 的两侧空格是语法的一部分
+    #    官方解析正则：`/(\s+)((?:\[\*[\s\S]+?\*\])+)(\s)/g`
+    #    拼完消息后顺手 strip 一下，前导空格就没了 → 接收端认不出这是 @，只显示成普通文字
+    at_pattern = re.compile(r"(\s+)(?:\[\*[\s\S]+?\*\])(\s)")
+    at_id_pattern = re.compile(r"(\s+)(?:\[@[\s\S]+?@\])(\s)")
+    quote_pattern = re.compile(r" \(_hr\) .+? \(hr_\) ")
+    problems = []
+    details = []
+    for label, components in (
+            ("at 在开头", [{"type": "at", "data": {"target_user_id": "65abb7a99dc60"}},
+                           {"type": "text", "data": "你好"}]),
+            ("at 在末尾", [{"type": "text", "data": "你好"},
+                           {"type": "at", "data": {"target_user_id": "65abb7a99dc60"}}]),
+            ("只有 at", [{"type": "at", "data": {"target_user_id": "65abb7a99dc60"}}]),
+            ("at 在中间", [{"type": "text", "data": "你好"},
+                           {"type": "at", "data": {"target_user_id": "65abb7a99dc60"}},
+                           {"type": "text", "data": "在吗"}]),
+    ):
+        text = await instance._extract_text(_message(components, group_id="64d5f8e17b2ad"))
+        details.append(f"{label}={text!r}")
+        if not at_pattern.search(text):
+            problems.append(f"{label}: {text!r} 不符合官方 @ 语法（两侧必须有空格）")
+    uid_only = await instance._extract_text(
+        _message([{"type": "at", "data": {"target_user_id": "fffffffffffff"}}],
+                 group_id="64d5f8e17b2ad"))
+    details.append(f"按 uid={uid_only!r}")
+    if not at_id_pattern.search(uid_only):
+        problems.append(f"按 uid 提及不符合官方语法: {uid_only!r}")
+
+    quote_text = await instance._extract_text({
+        "message_id": "m1", "platform": "iirose",
+        "message_info": {"user_info": {"user_id": "u1", "user_nickname": "Es."},
+                         "additional_config": {},
+                         "group_info": {"group_id": "64d5f8e17b2ad"}},
+        "raw_message": [{"type": "reply", "data": {"target_message_id": "760771550794"}},
+                        {"type": "text", "data": "嗯嗯"}]})
+    details.append(f"引用={quote_text!r}")
+    if not quote_pattern.search(quote_text):
+        problems.append(f"引用标记的空格不对（官方按 ` (_hr) ` / ` (hr_) ` 拆）: {quote_text!r}")
+    report(start_index + 4, "出站 @ / 引用的两侧空格符合官方解析正则（不能被 strip 掉）", problems,
+           " | ".join(details))
+
+    return failures
+
+
+def _check_config_labels(start_index: int) -> int:
+    """静态检查：每个配置字段都要有中文 label，否则 WebUI 面板上只显示英文键名。"""
+    import ast
+
+    source_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plugin.py")
+    tree = ast.parse(open(source_path, encoding="utf-8").read())
+
+    missing: list[str] = []
+    total = 0
+    sections: list[str] = []
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef) or not node.name.endswith("Section"):
+            continue
+        sections.append(node.name)
+        has_ui_label = any(
+            isinstance(item, ast.Assign)
+            and any(getattr(t, "id", "") == "__ui_label__" for t in item.targets)
+            for item in node.body
+        )
+        if not has_ui_label:
+            missing.append(f"{node.name}: 缺少 __ui_label__（配置节标题）")
+
+        for item in node.body:
+            if not isinstance(item, ast.AnnAssign) or not isinstance(item.value, ast.Call):
+                continue
+            call = item.value
+            if getattr(call.func, "id", "") != "Field":
+                continue
+            field = getattr(item.target, "id", "?")
+            total += 1
+            extra = next((kw.value for kw in call.keywords if kw.arg == "json_schema_extra"), None)
+            if extra is None:
+                missing.append(f"{node.name}.{field}: 没有 json_schema_extra")
+                continue
+            label = None
+            if isinstance(extra, ast.Dict):
+                for key, value in zip(extra.keys, extra.values):
+                    if isinstance(key, ast.Constant) and key.value == "label":
+                        label = value
+            if label is None or not isinstance(label, ast.Constant) or not isinstance(label.value, str):
+                missing.append(f"{node.name}.{field}: 缺少 label")
+            elif not any("\u4e00" <= ch <= "\u9fff" for ch in label.value):
+                missing.append(f"{node.name}.{field}: label 不是中文（{label.value!r}）")
+
+    problems = list(missing)
+    if problems:
+        failures = 1
+    else:
+        failures = 0
+    print(f"[{'FAIL' if problems else 'PASS'}] {start_index}. "
+          f"配置字段全部带中文 label（{total} 个字段 / {len(sections)} 个配置节）")
+    for problem in problems:
+        print(f"        {problem}")
+    return failures
+
+
+async def _check_quote_ref(start_index: int) -> int:
+    """引用标记里的数字必须是**被引用消息的时间戳（秒）**，不是消息 id。
+
+    真实事故：把 12 位随机消息 id（`828102986562`）当成时间戳发出去，
+    IIROSE 客户端按日期渲染，房间里显示成 **6088 年 9 月 19 日**。
+    所以这里锁死两条：ref 必须是秒级时间戳；拿不到时间戳就不发引用。
+    """
+    failures = 0
+
+    def report(index: int, name: str, problems: list[str], detail: str = "") -> None:
+        nonlocal failures
+        if problems:
+            failures += 1
+        print(f"[{'PASS' if not problems else 'FAIL'}] {index}. {name}{(' → ' + detail) if detail else ''}")
+        for problem in problems:
+            print(f"        {problem}")
+
+    # 1) 正常引用：ref = 秒级时间戳，绝不能是消息 id
+    instance = _plugin()
+    adapter.IIRoseAdapterPlugin.config.image_host.enabled = False
+    instance._remember("828102986562", user_id="6088e40d12bd1", user_name="天忧",
+                       timestamp=1789271137, text="要正面")
+    text = await instance._extract_text(
+        _message([{"type": "reply", "data": {"target_message_id": "828102986562"}},
+                  {"type": "text", "data": "反面、正面、正面"}], group_id="6a7c38409e902"))
+    problems = []
+    if "_hr) 天忧_1789271137 (hr_" not in text:
+        problems.append(f"ref 不是秒级时间戳：{text!r}")
+    if "828102986562" in text:
+        problems.append(f"消息 id 混进了引用标记（客户端会渲染成 6088 年）：{text!r}")
+    report(start_index, "引用的 ref 是时间戳秒、不是消息 id（不再渲染出 6088 年）",
+           problems, repr(text))
+
+    # 2) 缓存里的时间戳本身就不合理（历史 bug 形态：直接把消息 id 存成时间戳）
+    instance = _plugin()
+    instance._remember("828102986562", user_id="6088e40d12bd1", user_name="天忧",
+                       timestamp=828102986562, text="要正面")
+    text = await instance._extract_text(
+        _message([{"type": "reply", "data": {"target_message_id": "828102986562"}},
+                  {"type": "text", "data": "反面、正面、正面"}], group_id="6a7c38409e902"))
+    report(start_index + 1, "缓存里的时间戳越界（12 位消息 id 冒充）→ 拒绝发引用",
+           [] if text == "反面、正面、正面" else [f"text={text!r}"], repr(text))
+
+    # 3) 入站 → 出站往返：ref 等于入站报文里的时间戳，而不是报文里的消息 id
+    instance = _plugin()
+    kind, inbound = adapter.parse_frame(
+        _room_frame("要正面", message_id="828102986562", user_name="天忧",
+                    timestamp=1789271137))
+    await instance._dispatch_inbound(kind, inbound)
+    text = await instance._extract_text(
+        _message([{"type": "reply", "data": {"target_message_id": "828102986562"}},
+                  {"type": "text", "data": "反面、正面、正面"}], group_id="6a7c38409e902"))
+    problems = []
+    if "_hr) 天忧_1789271137 (hr_" not in text:
+        problems.append(f"往返后的 ref 不对：{text!r}")
+    if "要正面 (_hr)" not in text:
+        problems.append(f"被引用正文丢失：{text!r}")
+    report(start_index + 2, "入站 → 出站往返：ref 用报文时间戳（字段 0），不用消息 id（字段 10）",
+           problems, repr(text))
+
+    # 4) 时间戳缺失（0）→ 不发引用，退化成普通文本
+    instance = _plugin()
+    instance._remember("123456789012", user_id="u1", user_name="某人",
+                       timestamp=0, text="啥也没说")
+    text = await instance._extract_text(
+        _message([{"type": "reply", "data": {"target_message_id": "123456789012"}},
+                  {"type": "text", "data": "回一句"}], group_id="6a7c38409e902"))
+    report(start_index + 3, "时间戳缺失（0）→ 不发引用，退化成普通文本",
+           [] if text == "回一句" else [f"text={text!r}"], repr(text))
+
+    return failures
+
+
 def main() -> int:
     return asyncio.run(_main())
 
@@ -1280,12 +1847,18 @@ async def _main() -> int:
           f"{'复现出站失败' if not legacy else '未复现'}\n")
 
     outbound_checks = 3
-    inbound_checks = 11
+    inbound_checks = 12
     member_checks = 7
-    media_checks = 6
+    media_checks = 8
     image_host_checks = 15
     chat_list_checks = 2
+    room_change_checks = 4
     connection_checks = 4
+    config_label_checks = 1
+    shutdown_checks = 2
+    room_name_checks = 4
+    at_checks = 5
+    quote_ref_checks = 4
     failures += await _check_gateway(len(CASES) + 1)
     failures += await _check_inbound(len(CASES) + outbound_checks + 1)
     failures += await _check_member_events(len(CASES) + outbound_checks + inbound_checks + 1)
@@ -1296,13 +1869,38 @@ async def _main() -> int:
     failures += await _check_chat_list(
         len(CASES) + outbound_checks + inbound_checks + member_checks + media_checks
         + image_host_checks + 1)
-    failures += await _check_connection(
+    failures += await _check_room_change(
         len(CASES) + outbound_checks + inbound_checks + member_checks + media_checks
         + image_host_checks + chat_list_checks + 1)
+    failures += await _check_connection(
+        len(CASES) + outbound_checks + inbound_checks + member_checks + media_checks
+        + image_host_checks + chat_list_checks + room_change_checks + 1)
+
+    failures += _check_config_labels(
+        len(CASES) + outbound_checks + inbound_checks + member_checks + media_checks
+        + image_host_checks + chat_list_checks + room_change_checks + connection_checks + 1)
+    failures += await _check_shutdown(
+        len(CASES) + outbound_checks + inbound_checks + member_checks + media_checks
+        + image_host_checks + chat_list_checks + room_change_checks + connection_checks
+        + config_label_checks + 1)
+    failures += await _check_room_names(
+        len(CASES) + outbound_checks + inbound_checks + member_checks + media_checks
+        + image_host_checks + chat_list_checks + room_change_checks + connection_checks
+        + config_label_checks + shutdown_checks + 1)
+    failures += await _check_at(
+        len(CASES) + outbound_checks + inbound_checks + member_checks + media_checks
+        + image_host_checks + chat_list_checks + room_change_checks + connection_checks
+        + config_label_checks + shutdown_checks + room_name_checks + 1)
+    failures += await _check_quote_ref(
+        len(CASES) + outbound_checks + inbound_checks + member_checks + media_checks
+        + image_host_checks + chat_list_checks + room_change_checks + connection_checks
+        + config_label_checks + shutdown_checks + room_name_checks + at_checks + 1)
 
     total = (len(CASES) + outbound_checks + inbound_checks
              + member_checks + media_checks + image_host_checks
-             + chat_list_checks + connection_checks)
+             + chat_list_checks + room_change_checks + connection_checks
+             + config_label_checks + shutdown_checks + room_name_checks + at_checks
+             + quote_ref_checks)
     print(f"\n{total - failures}/{total} 通过")
     return 1 if failures else 0
 
