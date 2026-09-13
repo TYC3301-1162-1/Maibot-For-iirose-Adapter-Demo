@@ -43,6 +43,7 @@ RECENT_MESSAGES = 200          # 近期消息缓存条数，用于回复时还�
 UPLOAD_CACHE_SIZE = 2000       # 图床结果缓存条数（按内容指纹去重，重启后仍有效）
 UPLOAD_CACHE_FILE = "image_host_cache.json"
 STABLE_CONNECTION_SECONDS = 30.0   # 连接稳定超过这么久才重置重连退避
+MOVE_ROOM_SETTLE_SECONDS = 1.5     # 切房指令发出后等服务端处理的间隔
 
 
 def backoff_delay(attempt: int, base: float, cap: float) -> float:
@@ -104,7 +105,7 @@ def decode_frame(data: bytes | str) -> str:
 
 def build_login(room_id: str, username: str, password: str,
                 room_password: str | None = None, status: str = "n",
-                signature: str = "") -> str:
+                signature: str = "", last_room_id: str = "") -> str:
     payload: Dict[str, str] = {
         "r": room_id,
         "n": username,
@@ -118,6 +119,9 @@ def build_login(room_id: str, username: str, password: str,
     }
     if room_password:
         payload["rp"] = room_password
+    if last_room_id:
+        # 切房后重连认证要带上原房间 id（协议里叫 lr）
+        payload["lr"] = last_room_id
     return "*" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -141,21 +145,59 @@ def encode_private_message(target_uid: str, text: str, mc: str = DEFAULT_MC) -> 
                       ensure_ascii=False, separators=(",", ":"))
 
 
-# ---------------- 消息内容语法（IIROSE 逆向文档 5.1 / 6.2） ----------------
+# ---------------- 消息内容语法（逆向文档「正文里的特殊语法」） ----------------
 #
-#   @用户     ` [*用户名*] `（两侧空格）
-#   @房间     ` [_房间id_] `
-#   引用      `旧内容 (_hr) 发送者_时间戳秒 (hr_) 新内容`
+#   @用户     ` [*用户名*] `（**两侧空格是语法的一部分**，官方正则 `(\s+)(\[\*…\*\])(\s)`）
+#   @频道     ` [_{频道id}_] `
+#   引用      `旧内容 (_hr) 发送者_时间戳秒 (hr_) 新内容`（标记两侧同样带空格）
 #   图片      `[url#e]`；文件 `[url]`；语音 URL 需以 .weba 结尾；链接 `\url`
 #
-# 官方只有「按用户名 @」，没有 [@uid@] 这种写法；后者仅作为旧数据的兼容分支保留。
+# 引用标记里是**被引用消息的时间戳（秒）**，不是消息 id。客户端拿到这个数字会
+# 按日期渲染成「xxxx年x月x日」，喂 12 位随机消息 id 就会显示成 6088 年这种鬼日期。
+# 官方 `PublicMessage.ts` 把它存进名为 `time` 的字段，third-party.md 也写作
+# 「发送者_时间戳秒」。（`messages.md` 散文里那句「发送者_消息id」是文档误记。）
+# `[@uid@]` 是官方的 at-by-id 写法，客户端会按 UID 反查名字。
 
-MENTION_RE = re.compile(r"\[\*([^*\]]+)\*\]|\[_([A-Za-z0-9_]+)_\]|\[@([A-Za-z0-9_]+)@\]")
+MENTION_RE = re.compile(r"\[\*([\s\S]+?)\*\]|\[_([A-Za-z0-9_]+)_\]|\[@([A-Za-z0-9_]+)@\]")
 QUOTE_RE = re.compile(r"^(?P<quoted>.*?)\s*\(_hr\)\s*(?P<who>.*?)\s*\(hr_\)\s*(?P<tail>.*)$", re.S)
 QUOTE_AUTHOR_RE = re.compile(r"^(?P<who>.*)_(?P<ref>\d+)$")
+# 引用时间戳的合理区间（2000-01-01 ~ 2100-01-01），越界说明拿到的根本不是时间戳
+QUOTE_TS_MIN = 946_684_800
+QUOTE_TS_MAX = 4_102_444_800
+
 IMAGE_CONTENT_RE = re.compile(r"^\[?((?:https?://)[^\s\]]+?)(?:#e)?\]?$")
 # 收发两端都用的图片标记：`[url#e]` 是图片，`[url]` 是文件
 IMAGE_MARK_RE = re.compile(r"\[(https?://[^\s\]]+?)#e\]")
+# 房间号：13 位 hex（双房用 `_` 连接两个，例如 5b792cb650749_6a4a56d0b4ca7）
+ROOM_ID_RE = re.compile(r"^(?=.*[a-f])[a-f0-9]{10,}(?:_[a-f0-9]{10,})*$")
+
+
+def strip_wrapper(value: Any, mark: str) -> str:
+    """剥离 IIROSE 界面上的包裹语法。
+
+    `mark` 是括号里的符号：`*` → `[*名字*]`、`@` → `[@uid@]`、`_` → `[_房间id_]`。
+    官方 adapter 的配置说明就是这么处理的（「可填写 `[*用户名*]`，适配器会自动剥离」），
+    用户从 IIROSE 界面复制粘贴时很容易带着这层括号，不剥离就会导致
+    「机器人认不出自己被 @」这类问题。
+    """
+    text = str(value or "").strip()
+    left, right = f"[{mark}", f"{mark}]"
+    if len(text) > len(left) + len(right) and text.startswith(left) and text.endswith(right):
+        text = text[len(left):-len(right)].strip()
+    return text
+
+
+def normalize_username(value: Any) -> str:
+    return strip_wrapper(value, "*")
+
+
+def normalize_uid(value: Any) -> str:
+    # 文档：UID 可填 `[@uid@]` 或大写形式，适配器会转小写
+    return strip_wrapper(value, "@").lower()
+
+
+def normalize_room_id(value: Any) -> str:
+    return strip_wrapper(value, "_")
 
 # ---------------- 点歌 / 点播卡片 ----------------
 #
@@ -169,7 +211,11 @@ IMAGE_MARK_RE = re.compile(r"\[(https?://[^\s\]]+?)#e\]")
 # 这里两类都认，并把卡片转成一句人能读的话交给麦麦。
 
 MEDIA_CARD_PREFIX = "m__4"
-MEDIA_CARD_ORIGIN_RE = re.compile(r"^[=@*][0-8]?$")
+# 卡片子类型（commands.md 的「点播卡片消息 m__4」表）：
+#   @ 音乐卡 / = 音乐卡带封面 / % 音乐卡带封面(变体)
+#   # 视频卡 / * 视频卡带封面 / ! 视频卡带封面(变体)
+# 后面跟平台数字 0~8
+MEDIA_CARD_ORIGIN_RE = re.compile(r"^[=@*%#!][0-8]?$")
 MEDIA_CARD_ORIGINS = {
     "=0": "音乐", "=1": "视频",
     "@0": "网易云", "@1": "虾米", "@2": "QQ音乐", "@3": "千千", "@4": "酷狗",
@@ -177,7 +223,33 @@ MEDIA_CARD_ORIGINS = {
     "*0": "爱奇艺", "*1": "腾讯视频", "*2": "YouTube", "*3": "B站", "*4": "芒果TV",
     "*5": "抖音", "*6": "快手", "*7": "163MV", "*8": "B站直播",
 }
+# 带封面变体（% / # / !）沿用同数字的平台表
+_MEDIA_MUSIC_PLATFORMS = ("网易云", "虾米", "QQ音乐", "千千", "酷狗",
+                          "喜马拉雅", "荔枝", "回声", "5sing")
+_MEDIA_VIDEO_PLATFORMS = ("爱奇艺", "腾讯视频", "YouTube", "B站", "芒果TV",
+                          "抖音", "快手", "163MV", "B站直播")
+_MEDIA_MUSIC_MARKS = ("@", "%")
+_MEDIA_VIDEO_MARKS = ("*", "#", "!")
 DURATION_MARKER = "11451"
+
+
+def describe_media_origin(origin: str) -> tuple[str, bool]:
+    """平台标识 → (平台名, 是否视频卡)。
+
+    `=0`/`=1` 是通用的音乐/视频卡；`@`/`%` + 数字是音乐平台；
+    `*`/`#`/`!` + 数字是视频平台（三组是带不带封面的变体，数字含义相同）。
+    """
+    mark = str(origin or "")[:1]
+    digit = str(origin or "")[1:]
+    if mark == "=":
+        return ("视频" if digit == "1" else "音乐", digit == "1")
+    if mark in _MEDIA_VIDEO_MARKS:
+        return (_MEDIA_VIDEO_PLATFORMS[int(digit)] if digit.isdigit() and int(digit) < 9
+                else "视频", True)
+    if mark in _MEDIA_MUSIC_MARKS:
+        return (_MEDIA_MUSIC_PLATFORMS[int(digit)] if digit.isdigit() and int(digit) < 9
+                else "音乐", False)
+    return ("视频" if mark in _MEDIA_VIDEO_MARKS else "音乐", mark in _MEDIA_VIDEO_MARKS)
 
 _ENTITY_MAP = {"&amp;": "&", "&lt;": "<", "&gt;": ">",
                "&quot;": '"', "&#39;": "'", "&#x2F;": "/"}
@@ -192,6 +264,42 @@ def decode_entities(text: str) -> str:
         if current == previous:
             return current
         previous = current
+
+
+def parse_room_directory(payload: str) -> Dict[str, str]:
+    """从 `%` 初始化 / 刷新大包里提取「房间号 → 房间名」。
+
+    报文结构（逆向文档 6.1）：`%` 之后按 `"` 分成三段，第一段是「用户+房间」列表；
+    段内按 `<` 分记录、记录内按 `>` 分字段。房间记录的判据是首字段长得像房间号
+    （`/^(?=.*[a-f])([a-f0-9]{10,}_?)+$/`），第二个字段就是房间名。
+
+    实测样例：
+        `'5b792cb650749_6a4a56d0b4ca7>存在放映社 | MeowTV>4,88,58>2003>>://r.iirose.com/...`
+    双房用 `_` 连接两个房间号，名字用 ` | ` 连接。
+    """
+    names: Dict[str, str] = {}
+    for record in str(payload or "").split('"')[0].split("<"):
+        if not record:
+            continue
+        fields = record.split(">")
+        if len(fields) < 2:
+            continue
+        room_id = fields[0].lstrip("'").strip()
+        name = fields[1].strip()
+        if not name or not ROOM_ID_RE.match(room_id):
+            continue
+
+        names[room_id] = name
+        # 双房：把两个房间号分别登记（名字也按 ` | ` 拆开对应）
+        sub_ids = room_id.split("_")
+        sub_names = [item.strip() for item in name.split("|")]
+        if len(sub_ids) == len(sub_names):
+            for sub_id, sub_name in zip(sub_ids, sub_names):
+                names.setdefault(sub_id, sub_name)
+        else:
+            for sub_id in sub_ids:
+                names.setdefault(sub_id, name)
+    return names
 
 
 def parse_media_card(text: str) -> Optional[Dict[str, Any]]:
@@ -218,16 +326,17 @@ def parse_media_card(text: str) -> Optional[Dict[str, Any]]:
     bitrate = next((item for item in extra
                     if item and not item.startswith(DURATION_MARKER)), "")
 
+    platform, is_video = describe_media_origin(origin)
     return {
         "origin": origin,
-        "platform": MEDIA_CARD_ORIGINS.get(origin, "视频" if origin.startswith("*") else "音乐"),
+        "platform": platform,
         "title": decode_entities(parts[1]).strip(),
         "author": decode_entities(parts[2]).strip(),
         "cover": parts[3].strip(),
         "color": parts[4].strip(),
         "bitrate": bitrate,
         "duration": duration,
-        "is_video": origin.startswith("*") or origin == "=1",
+        "is_video": is_video,
     }
 
 
@@ -319,11 +428,17 @@ def is_id_allowed_by_policy(target_id: str, list_type: str, configured: Any) -> 
 
 
 def format_quote(quoted: str, who: str, timestamp: str, text: str) -> str:
-    """按官方语法拼一条引用消息：`旧内容 (_hr) 发送者_时间戳秒 (hr_) 新内容`。"""
+    """按官方语法拼一条引用消息：`旧内容 (_hr) 发送者_时间戳秒 (hr_) 新内容`。
+
+    两处空格同样是语法的一部分：官方解析器是**按 ` (_hr) ` 与 ` (hr_) ` 拆的**
+    （PublicMessage.ts 的 `msg.split(' (hr_) ')`），少了空格就拆不出来。
+    没有旧内容时也保留标记前的空格，这样对方的解析器仍能识别成引用。
+    """
     marker = f"(_hr) {who}_{timestamp} (hr_)"
+    body = text.lstrip()      # 标记后面的空格已经提供了分隔，避免叠成两个空格
     if quoted:
-        return f"{quoted} {marker} {text}".strip()
-    return f"{marker} {text}".strip()
+        return f"{quoted} {marker} {body}"
+    return f" {marker} {body}"
 
 
 def normalize_inbound_text(text: str) -> str:
@@ -403,15 +518,21 @@ def classify_member_event(parts: list[str]) -> Optional[Dict[str, Any]]:
     return None
 
 
-def describe_member_event(event: Dict[str, Any]) -> str:
-    """把成员事件整理成一句给麦麦/日志看的中文。"""
+def describe_member_event(event: Dict[str, Any], room_label: str = "") -> str:
+    """把成员事件整理成一句给麦麦/日志看的中文。
+
+    `room_label` 是「房间名 (房间号)」这样的可读标签，由调用方从房间目录里查好后传进来
+    —— 模块级函数拿不到插件实例，所以不在这里查表。换房 / 进入房间时带上，
+    离开就不用带了（本来就是当前房间）。
+    """
     name = str(event.get("user_name") or event.get("user_id") or "有人")
     if event.get("event") == "join":
-        return f"{name} 重新连接进入房间" if event.get("join_type") == "reconnect" \
-            else f"{name} 进入了房间"
-    if event.get("is_move"):
-        return f"{name} 去了别的房间（{event.get('target_room_id')}）"
-    return f"{name} 离开了房间"
+        action = "重新连接进入房间" if event.get("join_type") == "reconnect" else "进入了房间"
+    elif event.get("is_move"):
+        return f"{name} 去了别的房间 → {room_label or event.get('target_room_id') or '未知房间'}"
+    else:
+        return f"{name} 离开了房间"
+    return f"{name} {action}" + (f" → {room_label}" if room_label else "")
 
 
 def _split(payload: str) -> list[str]:
@@ -474,6 +595,14 @@ def parse_frame(text: str) -> tuple[str, Any]:
     # 服务端 `c` 是应用层心跳启动包，收到后需要回发 `c`（否则会被判定掉线）
     if text[:1] == "c" and len(text) <= 16:
         return "heartbeat", text
+
+    # 切房确认（`m`）与失败错误码（`m!5` 未提供密码）
+    if text[:1] == "m" and len(text) <= 32:
+        return "room_move", text
+
+    # 密码房校验结果（`` `~1 `` 正确 / `` `~0 `` 错误）
+    if text.startswith("`~"):
+        return "room_password", text
 
     # fetchMsg 按双引号拆分：段1 = 公屏，段2 = 私聊；`""` 开头表示公屏段为空
     if text.startswith('""'):
@@ -646,6 +775,10 @@ class IIRoseClient:
         self._stall_timeout = max(0.0, float(stall_timeout or 0.0))
         self._max_reconnect = max(self._reconnect_base, float(max_reconnect_seconds or 300.0))
         self._ws: Any = None
+        # 只由 close() 清空的引用：run() 收尾时会把 _ws 置空，
+        # 如果 close() 只看 _ws，插件停用时就会「找不到 socket」而根本没关连接，
+        # 服务端会一直以为机器人还在线。
+        self._socket_to_close: Any = None
         self._stop = False
         self._last_frame_at = time.monotonic()
         self._connected_at: Optional[float] = None
@@ -699,6 +832,7 @@ class IIRoseClient:
             close_timeout=self._timeout,
             max_size=None,
         )
+        self._socket_to_close = self._ws
         self._last_frame_at = time.monotonic()
         self._connected_at = self._last_frame_at
         self._logger.info("IIROSE 已连接 %s", url)
@@ -814,101 +948,197 @@ class IIRoseClient:
             await self._sleep(delay)
 
     async def close(self) -> None:
+        """停止并**真正关闭** WebSocket。
+
+        IIROSE 没有「下线报文」，服务端就是靠 WS 断开把用户标记为离开
+        （官方 adapter 的 `WsClient.stop()` 也是 `socket.close(1000, 'Plugin disposing')`）。
+        所以这里必须确保 socket 被关掉：用 `_socket_to_close` 而不是 `_ws`，
+        因为 run() 收尾时会把 `_ws` 置空。
+        """
         self._stop = True
-        ws, self._ws = self._ws, None
-        if ws is not None:
-            try:
-                await ws.close()
-            except Exception:
-                pass
+        ws, self._socket_to_close = self._socket_to_close, None
+        self._ws = None
+        if ws is None:
+            return
+        try:
+            await ws.close(1000, "plugin disposing")
+            self._logger.info("IIROSE 连接已关闭（已下线）")
+        except Exception:
+            self._logger.debug("关闭 IIROSE 连接时出错", exc_info=True)
 
 
 # ---------------- 配置模型 ----------------
+#
+# 每个字段都带 `json_schema_extra={"label": ...}`，WebUI 配置面板会优先显示它，
+# 否则面板上只会出现 `user_list_enabled` 这种英文键名，分不清哪个是哪个。
+# `hint` 是字段下方的补充说明；`placeholder` 是输入框灰字示例。
 
 class PluginSection(PluginConfigBase):
-    __ui_label__ = "插件设置"
-    enabled: bool = Field(default=False, description="是否启用并连接 IIROSE")
-    config_version: str = Field(default="0.1.0", description="配置版本号（勿改）")
+    __ui_label__ = "① 插件设置"
+    enabled: bool = Field(default=False, description="是否启用并连接 IIROSE",
+                          json_schema_extra={"label": "启用适配器"})
+    config_version: str = Field(default="0.1.0", description="配置版本号（勿改）",
+                                json_schema_extra={"label": "配置版本（勿改）"})
 
 
 class AccountSection(PluginConfigBase):
-    __ui_label__ = "IIROSE 账号"
-    username: str = Field(default="", description="机器人用户名（不带 [* *]）")
-    uid: str = Field(default="", description="13 位唯一标识，用于过滤机器人自己的消息")
+    __ui_label__ = "② IIROSE 账号"
+    username: str = Field(default="", description="机器人用户名（不带 [* *]）",
+                          json_schema_extra={"label": "机器人用户名", "placeholder": "例如 03酱"})
+    uid: str = Field(default="", description="13 位唯一标识，用于过滤机器人自己的消息",
+                     json_schema_extra={"label": "机器人 UID（唯一标识）",
+                                        "hint": "个人资料页的「唯一标识」，强烈建议填写："
+                                                "否则会自问自答、也无法判断有谁 @ 了机器人",
+                                        "placeholder": "13 位小写字母数字，例如 62b98115cefd2"})
     password: str = Field(default="", description="账号密码，仅本地用于计算 MD5",
-                          json_schema_extra={"x-widget": "password"})
-    room_id: str = Field(default="", description="初始房间 ID，例如 64d5f8e17b2ad")
-    room_password: str = Field(default="", description="加密房间密码，一般留空")
+                          json_schema_extra={"label": "账号密码",
+                                             "hint": "仅本地用于计算 MD5，不会明文外发",
+                                             "x-widget": "password"})
+    room_id: str = Field(default="", description="初始房间 ID，例如 64d5f8e17b2ad",
+                         json_schema_extra={"label": "房间 ID",
+                                            "hint": "改这里会实时切房：先发移动指令，再下线重连进新房间",
+                                            "placeholder": "13 位房间号，例如 16a7c38409e902"})
+    room_password: str = Field(default="", description="加密房间密码，一般留空",
+                               json_schema_extra={"label": "房间密码", "hint": "密码房才需要填"})
 
 
 class BotSection(PluginConfigBase):
-    __ui_label__ = "机器人外观"
-    status: str = Field(default="n", description="平台状态码：n / 0 / d / 8 …")
-    signature: str = Field(default="Bot of MaiBot", description="个性签名")
-    only_hang_up: bool = Field(default=False, description="静默模式：只接收不发送")
+    __ui_label__ = "③ 机器人外观"
+    status: str = Field(default="n", description="平台状态码：n / 0 / d / 8 …",
+                        json_schema_extra={"label": "在线状态",
+                                           "hint": "n 无状态 / 0 会话中 / 1 忙碌中 / 2 离开中 / "
+                                                   "8 睡觉中 / f 请撩我",
+                                           "x-widget": "select",
+                                           "choices": ["n", "0", "1", "2", "3", "4", "5", "6",
+                                                       "7", "8", "9", "a", "b", "c", "d", "e", "f"]})
+    signature: str = Field(default="Bot of MaiBot", description="个性签名",
+                           json_schema_extra={"label": "个性签名"})
+    only_hang_up: bool = Field(default=False, description="静默模式：只接收不发送",
+                               json_schema_extra={"label": "静默模式（只收不发）",
+                                                  "hint": "打开后机器人只读不回，用来排查问题"})
     report_member_events: bool = Field(
-        default=True, description="把房间成员上线/下线/重连/换房作为通知上报给 MaiBot（日志始终记录）")
+        default=True, description="把房间成员上线/下线/重连/换房作为通知上报给 MaiBot（日志始终记录）",
+        json_schema_extra={"label": "上报成员上下线",
+                           "hint": "关掉后只在日志里记录，不交给麦麦"})
     hello_on_login: bool = Field(
-        default=False, description="登录成功后向房间发一条自测消息（单独验证出站通道）")
+        default=False, description="登录成功后向房间发一条自测消息（单独验证出站通道）",
+        json_schema_extra={"label": "上线自测消息",
+                           "hint": "用来单独验证「机器人能不能发出消息」，验证完记得关掉"})
     hello_text: str = Field(
-        default="【IIROSE 适配器】已上线~", description="自测消息内容")
+        default="【IIROSE 适配器】已上线~", description="自测消息内容",
+        json_schema_extra={"label": "自测消息内容"})
 
 
 class ConnectionSection(PluginConfigBase):
-    __ui_label__ = "连接设置"
-    keepalive: bool = Field(default=True, description="启用心跳保活")
+    __ui_label__ = "④ 连接设置"
+    keepalive: bool = Field(default=True, description="启用心跳保活",
+                            json_schema_extra={"label": "心跳保活"})
     keepalive_interval_seconds: float = Field(
-        default=30.0, description="保活包发送间隔（秒）；官方 adapter 为 30 秒")
+        default=30.0, description="保活包发送间隔（秒）；官方 adapter 为 30 秒",
+        json_schema_extra={"label": "保活间隔（秒）",
+                           "hint": "官方 adapter 用 30 秒发一个空串保活，一般不用改"})
     stall_timeout_seconds: float = Field(
-        default=120.0, description="多久没收到任何数据就判定连接假死并重连（秒，0=关闭）")
-    timeout_ms: int = Field(default=5000, description="连接/登录超时（毫秒）")
+        default=120.0, description="多久没收到任何数据就判定连接假死并重连（秒，0=关闭）",
+        json_schema_extra={"label": "假死判定（秒）",
+                           "hint": "网络差导致误判断线时可以调大，0 = 关闭这项检测"})
+    timeout_ms: int = Field(default=5000, description="连接/登录超时（毫秒）",
+                            json_schema_extra={"label": "连接超时（毫秒）"})
     max_retries: int = Field(
-        default=5, description="连续失败达到该次数后转为长间隔重试（不会停止重连）")
-    reconnect_base_seconds: float = Field(default=2.0, description="重连退避基准秒数")
-    max_reconnect_seconds: float = Field(default=300.0, description="重连退避上限（秒）")
-    mc: str = Field(default=DEFAULT_MC, description="气泡颜色（6 位十六进制），一般无需修改")
-    debug_raw: bool = Field(default=False, description="打印原始报文，用于协议校准")
+        default=5, description="连续失败达到该次数后转为长间隔重试（不会停止重连）",
+        json_schema_extra={"label": "转长间隔重试的阈值",
+                           "hint": "达到这个次数后只是把重试间隔拉长，永远不会停止重连"})
+    reconnect_base_seconds: float = Field(default=2.0, description="重连退避基准秒数",
+                                          json_schema_extra={"label": "重连退避基准（秒）"})
+    max_reconnect_seconds: float = Field(default=300.0, description="重连退避上限（秒）",
+                                         json_schema_extra={"label": "重连退避上限（秒）"})
+    mc: str = Field(default=DEFAULT_MC, description="气泡颜色（6 位十六进制），一般无需修改",
+                    json_schema_extra={"label": "气泡颜色", "placeholder": "66ccff"})
+    debug_raw: bool = Field(default=False, description="打印原始报文，用于协议校准",
+                            json_schema_extra={"label": "打印原始报文",
+                                               "hint": "排查协议问题时才开，平时开着日志会很吵"})
 
 
 class ChatListSection(PluginConfigBase):
-    __ui_label__ = "黑白名单"
+    __ui_label__ = "⑤ 黑白名单"
     enabled: bool = Field(
-        default=False, description="启用聊天名单过滤；关闭时所有人都能触发麦麦回复")
+        default=False, description="总开关：关闭时下面三项名单全部不生效（安全起见默认关闭）",
+        json_schema_extra={"label": "名单总开关",
+                           "hint": "关闭时下面三个名单都不生效，所有人都能触发回复"})
+    user_list_enabled: bool = Field(
+        default=False, description="启用用户名单（独立开关，只影响用户维度）",
+        json_schema_extra={"label": "启用用户名单",
+                           "hint": "独立开关：只影响「谁能触发回复」，不影响房间名单"})
     user_list_type: str = Field(
         default="whitelist", description="用户名单模式：whitelist 只回名单内的人 / blacklist 不回名单内的人",
-        json_schema_extra={"x-widget": "select", "choices": ["whitelist", "blacklist"]})
+        json_schema_extra={"label": "用户名单模式", "x-widget": "select",
+                           "choices": ["whitelist", "blacklist"]})
     user_list: List[str] = Field(
         default_factory=list,
         description="用户名单：填 IIROSE 唯一标识（13 位 UID，个人资料页「唯一标识」）；"
-                    "也支持直接填用户名，按昵称兜底匹配")
+                    "也支持直接填用户名，按昵称兜底匹配",
+        json_schema_extra={"label": "用户名单",
+                           "hint": "一行一个：优先填 13 位 UID，也可以直接填用户名；"
+                                   "名单为空时本项不生效（不会拦人）"})
+    ban_user_enabled: bool = Field(
+        default=False, description="启用永久屏蔽名单（独立开关）",
+        json_schema_extra={"label": "启用永久屏蔽名单", "hint": "独立开关，优先级最高"})
     ban_user_list: List[str] = Field(
-        default_factory=list, description="永久屏蔽名单：这些人无论名单模式如何都不回复（UID 或用户名）")
+        default_factory=list, description="永久屏蔽名单：这些人无论名单模式如何都不回复（UID 或用户名）",
+        json_schema_extra={"label": "永久屏蔽名单", "hint": "一行一个，UID 或用户名"})
+    room_list_enabled: bool = Field(
+        default=False, description="启用房间名单（独立开关，一般不用；机器人只在自己所在的房间）",
+        json_schema_extra={"label": "启用房间名单",
+                           "hint": "一般用不到：机器人只会在自己登录的那个房间"})
     room_list_type: str = Field(
-        default="blacklist", description="房间名单模式（一般不用；机器人只在自己所在的房间）",
-        json_schema_extra={"x-widget": "select", "choices": ["whitelist", "blacklist"]})
-    room_list: List[str] = Field(default_factory=list, description="房间 ID 名单")
-    log_dropped: bool = Field(default=True, description="记录被名单拦下的消息（方便排查为什么不回复）")
+        default="blacklist", description="房间名单模式",
+        json_schema_extra={"label": "房间名单模式", "x-widget": "select",
+                           "choices": ["whitelist", "blacklist"]})
+    room_list: List[str] = Field(default_factory=list, description="房间 ID 名单",
+                                 json_schema_extra={"label": "房间名单", "hint": "一行一个房间 ID"})
+    log_dropped: bool = Field(default=True, description="记录被名单拦下的消息（方便排查为什么不回复）",
+                              json_schema_extra={"label": "记录被拦下的消息",
+                                                 "hint": "排查「为什么没回复」时很有用"})
 
 
 class ImageHostSection(PluginConfigBase):
-    __ui_label__ = "图床（图片 / 表情上传）"
+    __ui_label__ = "⑥ 图床（图片 / 表情上传）"
     enabled: bool = Field(
-        default=True, description="把麦麦发来的图片/表情先传到图床，再用返回的链接发送（IIROSE 只认 URL）")
-    base_url: str = Field(default=DEFAULT_IMAGE_HOST, description="图床地址")
-    upload_path: str = Field(default=DEFAULT_IMAGE_HOST_PATH, description="上传接口路径")
+        default=True, description="把麦麦发来的图片/表情先传到图床，再用返回的链接发送（IIROSE 只认 URL）",
+        json_schema_extra={"label": "启用图床",
+                           "hint": "关闭后图片/表情会退化成 [图片] [表情] 占位文字"})
+    base_url: str = Field(default=DEFAULT_IMAGE_HOST, description="图床地址",
+                          json_schema_extra={"label": "图床地址",
+                                             "hint": "必填：自己的图床首页地址，不带结尾斜杠",
+                                             "placeholder": "https://your-image-host.example.com"})
+    upload_path: str = Field(default=DEFAULT_IMAGE_HOST_PATH, description="上传接口路径",
+                             json_schema_extra={"label": "上传接口路径",
+                                                "placeholder": "/api/index.php"})
     token: str = Field(default=DEFAULT_IMAGE_HOST_TOKEN,
                        description="图床上传 token（在图床的 tokenList 里查）",
-                       json_schema_extra={"x-widget": "password"})
-    field_name: str = Field(default="image", description="上传表单里的文件字段名")
+                       json_schema_extra={"label": "图床上传 Token", "hint": "必填，个人凭据，别外传",
+                                          "x-widget": "password"})
+    field_name: str = Field(default="image", description="上传表单里的文件字段名",
+                            json_schema_extra={"label": "上传字段名", "hint": "一般不用改",
+                                               "placeholder": "image"})
     reuse_uploaded: bool = Field(
-        default=True, description="复用已上传过的图片：按内容指纹缓存链接，重启后依然生效，避免重复上传")
+        default=True, description="复用已上传过的图片：按内容指纹缓存链接，重启后依然生效，避免重复上传",
+        json_schema_extra={"label": "复用已上传图片",
+                           "hint": "同一张表情只传一次，重启后依然有效"})
     verify_upload: bool = Field(
-        default=True, description="校验链接真的能取到图片；取不到就重新上传（避免发出打不开的图）")
+        default=True, description="校验链接真的能取到图片；取不到就重新上传（避免发出打不开的图）",
+        json_schema_extra={"label": "校验图片链接",
+                           "hint": "上传后/复用前检查链接能否取到图片，取不到就重传"})
     verify_interval_hours: float = Field(
-        default=24.0, description="复用时多久重新校验一次链接（小时）；0 = 每次复用都校验")
-    verify_timeout_ms: int = Field(default=5000, description="链接校验超时（毫秒）")
-    timeout_ms: int = Field(default=15000, description="上传超时（毫秒）")
-    max_bytes: int = Field(default=8 * 1024 * 1024, description="单张图片最大字节数，超出则退化为占位文本")
+        default=24.0, description="复用时多久重新校验一次链接（小时）；0 = 每次复用都校验",
+        json_schema_extra={"label": "链接校验周期（小时）",
+                           "hint": "0 = 每次复用都校验（最保险但多一次请求）"})
+    verify_timeout_ms: int = Field(default=5000, description="链接校验超时（毫秒）",
+                                   json_schema_extra={"label": "链接校验超时（毫秒）"})
+    timeout_ms: int = Field(default=15000, description="上传超时（毫秒）",
+                            json_schema_extra={"label": "上传超时（毫秒）"})
+    max_bytes: int = Field(default=8 * 1024 * 1024, description="单张图片最大字节数，超出则退化为占位文本",
+                           json_schema_extra={"label": "单张图片大小上限（字节）",
+                                              "hint": "默认 8 MB"})
 
 
 class IIRosePluginConfig(PluginConfigBase):
@@ -940,6 +1170,14 @@ class IIRoseAdapterPlugin(MaiBotPlugin):
         # 已经提示过的通知投递失败原因，避免成员频繁上下线时刷屏
         self._notice_warned: set[str] = set()
         self._image_host_warned = False
+        # 名单开着但为空时只提示一次
+        self._chat_list_warned: set[str] = set()
+        # 当前实际登录的房间（用于配置改房间号时执行切房流程）
+        self._active_room_id = ""
+        # 切房重连时登录包要带的原房间 id（协议字段 lr）
+        self._last_room_id = ""
+        # 房间号 → 房间名（从 `%` 大包里解析，用于后台会话名 / 成员事件文案）
+        self._room_names: Dict[str, str] = {}
         # 图床结果缓存：sha256(图片字节) → URL，同一张表情不重复上传
         self._upload_cache: OrderedDict[str, str] = OrderedDict()
         self._upload_cache_loaded = False
@@ -1002,19 +1240,57 @@ class IIRoseAdapterPlugin(MaiBotPlugin):
         必须与 `_report_state` 上报的 account_id、以及入站 route_metadata 的 self_id
         保持完全一致，否则 Platform IO 的出站投递找不到本网关。
         """
-        settings = self._settings
-        return (settings.account.uid or settings.account.username or "iirose").strip()
+        return (self._self_uid or self._username or "iirose").strip()
+
+    # ---- 账号字段：剥离用户可能从 IIROSE 界面粘进来的包裹语法 ----
+
+    @property
+    def _username(self) -> str:
+        return normalize_username(self._settings.account.username)
+
+    @property
+    def _self_uid(self) -> str:
+        return normalize_uid(self._settings.account.uid)
+
+    @property
+    def _room_id(self) -> str:
+        return normalize_room_id(self._settings.account.room_id)
+
+    def _room_name(self, room_id: str) -> str:
+        """房间号 → 房间名；没抓到就用房间号本身兜底。"""
+        key = str(room_id or "").strip()
+        if not key:
+            return ""
+        return self._room_names.get(key, "")
+
+    def _describe_room(self, room_id: str) -> str:
+        """房间号 → `房间名 (房间号)`；没抓到名字就只给房间号。"""
+        key = str(room_id or "").strip()
+        if not key:
+            return ""
+        name = self._room_name(key)
+        if name and name != key:
+            return f"{name} ({key})"
+        return key
 
     # ---- 连接管理 ----
 
     async def _restart_connection_if_needed(self) -> None:
-        await self._stop_connection()
         settings = self._settings
+        target_room = str(self._room_id or "").strip()
+
+        # 配置里换了房间号：先按协议发切房指令，断线后带 `lr` 重连进新房间
+        if (self._client is not None and self._client.connected
+                and self._active_room_id and target_room
+                and target_room != self._active_room_id):
+            await self._move_room(self._active_room_id, target_room, settings)
+
+        await self._stop_connection()
 
         if not settings.plugin.enabled:
             self.ctx.logger.info("IIROSE 适配器未启用，保持空闲")
             return
-        if not (settings.account.username and settings.account.password and settings.account.room_id):
+        if not (self._username and settings.account.password and self._room_id):
             self.ctx.logger.error("IIROSE 配置不完整：username / password / room_id 均为必填")
             return
         if not IIRoseClient.is_available():
@@ -1043,17 +1319,50 @@ class IIRoseAdapterPlugin(MaiBotPlugin):
                 "IIROSE 图床未配置（image_host.base_url 为空），图片 / 表情将退化为占位文本；"
                 "如需发送图片请填写图床地址与 token")
         self.ctx.logger.info(
-            "IIROSE 适配器已启动连接任务（保活=%.0fs 停滞重连=%.0fs 退避上限=%.0fs 聊天名单：%s）",
+            "IIROSE 适配器已启动连接任务（账号=%s 房间=%s 保活=%.0fs 停滞重连=%.0fs 退避上限=%.0fs 聊天名单：%s）",
+            self._username or "-",
+            self._room_id or "-",
             settings.connection.keepalive_interval_seconds,
             settings.connection.stall_timeout_seconds,
             settings.connection.max_reconnect_seconds,
             self._describe_chat_list(),
         )
 
+    async def _move_room(self, old_room: str, new_room: str, settings: Any) -> None:
+        """按 IIROSE 协议换房间：密码房先验密码，再发移动包，随后断线重连。
+
+        协议里移动成功后必须断开 WS，重新发登录包把 `r` 改成目标房间，
+        并带上 `lr`（原房间 id）与 `rp`（目标房间密码）。
+        """
+        client = self._client
+        if client is None:
+            return
+        room_password = str(getattr(settings.account, "room_password", "") or "").strip()
+        self.ctx.logger.info("IIROSE 房间配置变更：%s → %s，执行切房", old_room, new_room)
+        try:
+            if room_password:
+                # 密码房先发询问包验密码
+                await client.send(f"=^~{new_room}>{room_password}")
+                await asyncio.sleep(MOVE_ROOM_SETTLE_SECONDS)
+            await client.send(f"m{new_room}")
+            self.ctx.logger.info("IIROSE 切房指令已发送（m%s），%.1fs 后断开并按新房间重连",
+                                 new_room, MOVE_ROOM_SETTLE_SECONDS)
+            await asyncio.sleep(MOVE_ROOM_SETTLE_SECONDS)
+        except Exception:
+            self.ctx.logger.warning("IIROSE 切房指令发送失败，直接按新房间重连", exc_info=True)
+        # 让登录包带上原房间，服务端才知道是从哪个房间切过来的
+        self._last_room_id = old_room
+
     async def _stop_connection(self) -> None:
         task, self._task = self._task, None
         client, self._client = self._client, None
 
+        # 顺序很重要：**先关 socket，再收尾任务**。
+        # 反过来的话 run() 的 finally 会先把 self._ws 置空，
+        # 之后 close() 就找不到 socket 了 —— 等于没关连接，
+        # 服务端会一直以为机器人还在线（插件停用/重载后不下线就是这么来的）。
+        if client is not None:
+            await client.close()
         if task is not None:
             task.cancel()
             try:
@@ -1062,17 +1371,16 @@ class IIRoseAdapterPlugin(MaiBotPlugin):
                 pass
             except Exception:
                 self.ctx.logger.debug("IIROSE 连接任务退出异常", exc_info=True)
-        if client is not None:
-            await client.close()
 
         self._login_ok = False
         self._awaiting_login = False
+        self._active_room_id = ""
         await self._report_state(False, message="stopped")
 
     async def _report_state(self, ready: bool, *, message: str = "") -> None:
         settings = self._settings
         account_id = self._account_id()
-        metadata: Dict[str, Any] = {"protocol": "iirose", "room_id": settings.account.room_id}
+        metadata: Dict[str, Any] = {"protocol": "iirose", "room_id": self._room_id}
         if message:
             metadata["message"] = message
         try:
@@ -1097,14 +1405,19 @@ class IIRoseAdapterPlugin(MaiBotPlugin):
         self._login_ok = False
         self._slow_login_warned = False
         await client.send(build_login(
-            room_id=settings.account.room_id,
-            username=settings.account.username,
+            room_id=self._room_id,
+            username=self._username,
             password=settings.account.password,
             room_password=settings.account.room_password or None,
             status=settings.bot.status,
             signature=settings.bot.signature,
+            last_room_id=self._last_room_id,
         ))
-        self.ctx.logger.info("IIROSE 登录报文已发送，等待服务端数据 …")
+        if self._last_room_id:
+            self.ctx.logger.info("IIROSE 登录报文已发送（切房重连：%s → %s），等待服务端数据 …",
+                                 self._last_room_id, self._room_id)
+        else:
+            self.ctx.logger.info("IIROSE 登录报文已发送，等待服务端数据 …")
         asyncio.create_task(self._warn_slow_login(), name="iirose-login-watch")
 
     async def _warn_slow_login(self) -> None:
@@ -1121,11 +1434,17 @@ class IIRoseAdapterPlugin(MaiBotPlugin):
             return
         self._login_ok = True
         self._awaiting_login = False
-        self.ctx.logger.info("IIROSE 登录成功（%s）", reason)
+        settings = self._settings
+        # 记下实际进到的房间，配置改房间号时据此判断要不要走切房流程
+        self._active_room_id = str(self._room_id or "")
+        if self._last_room_id:
+            self.ctx.logger.info("IIROSE 已切换到新房间 %s（原房间 %s）",
+                                 self._active_room_id or "-", self._last_room_id)
+        self._last_room_id = ""
+        self.ctx.logger.info("IIROSE 登录成功（%s），当前房间=%s", reason, self._active_room_id or "-")
         await self._report_state(True)
 
         # 出站自测：不经过 MaiBot 的回复流程，直接往房间发一条，用来单独验证发送通道。
-        settings = self._settings
         if not getattr(settings.bot, "hello_on_login", False):
             return
         if self._client is None or not self._client.connected:
@@ -1136,7 +1455,7 @@ class IIRoseAdapterPlugin(MaiBotPlugin):
                 str(getattr(settings.bot, "hello_text", "") or "【IIROSE 适配器】已上线~"),
                 settings.connection.mc))
             self.ctx.logger.info("IIROSE 上线测试消息已发送到房间 target=%s",
-                                 settings.account.room_id)
+                                 self._room_id)
         except Exception:
             self.ctx.logger.warning("IIROSE 上线测试消息发送失败", exc_info=True)
 
@@ -1151,52 +1470,78 @@ class IIRoseAdapterPlugin(MaiBotPlugin):
                          room_id: str) -> tuple[bool, str]:
         """黑白名单判定，返回 (是否放行, 原因)。
 
-        语义对齐官方 NapCat 适配器 filters.py：
-        永久屏蔽名单 → 房间名单 → 用户名单；名单模式为 whitelist 时只放行名单内的人。
+        三个名单各自有独立开关，互不影响：
+          `ban_user_enabled` → 永久屏蔽名单
+          `room_list_enabled` → 房间名单
+          `user_list_enabled` → 用户名单
+        总开关 `enabled` 关闭时三者都不生效。
+
+        白名单为空时**不再拦截所有人**——那只会让机器人莫名其妙装死，
+        这里当作「还没配」跳过并提示，行为与黑名单空名单一致。
         """
         settings = self._settings
         chat = getattr(settings, "chat_list", None)
-        if chat is None:
+        if chat is None or not getattr(chat, "enabled", False):
             return True, ""
 
-        for entry in list(getattr(chat, "ban_user_list", []) or []):
-            if matches_identity(entry, user_id, user_name):
-                return False, f"命中永久屏蔽名单（{entry}）"
-
-        if not getattr(chat, "enabled", False):
-            return True, ""
-
-        if kind == "room":
-            if not is_id_allowed_by_policy(room_id, getattr(chat, "room_list_type", "blacklist"),
-                                           getattr(chat, "room_list", []) or []):
-                return False, f"房间 {room_id} 未通过房间名单过滤"
-
-        entries = list(getattr(chat, "user_list", []) or [])
-        mode = str(getattr(chat, "user_list_type", "whitelist")).strip().lower()
-        if mode == "whitelist":
-            for entry in entries:
+        if getattr(chat, "ban_user_enabled", False):
+            for entry in list(getattr(chat, "ban_user_list", []) or []):
                 if matches_identity(entry, user_id, user_name):
-                    return True, ""
-            if not entries:
-                return False, "白名单模式但名单为空，所有消息都会被忽略"
-            return False, "不在白名单内"
+                    return False, f"命中永久屏蔽名单（{entry}）"
 
-        for entry in entries:
-            if matches_identity(entry, user_id, user_name):
-                return False, "命中黑名单"
+        if getattr(chat, "room_list_enabled", False):
+            entries = [str(item).strip() for item in (getattr(chat, "room_list", []) or [])
+                       if str(item).strip()]
+            if entries:
+                mode = str(getattr(chat, "room_list_type", "blacklist")).strip().lower()
+                hit = room_id in entries
+                if (mode == "whitelist") != hit:
+                    return False, (f"房间 {room_id} 不在房间白名单内" if mode == "whitelist"
+                                   else f"房间 {room_id} 命中房间黑名单")
+            else:
+                self._warn_empty_list("room_list", "房间名单")
+        if getattr(chat, "user_list_enabled", False):
+            entries = [str(item).strip() for item in (getattr(chat, "user_list", []) or [])
+                       if str(item).strip()]
+            if not entries:
+                self._warn_empty_list("user_list", "用户名单")
+                return True, ""
+            mode = str(getattr(chat, "user_list_type", "whitelist")).strip().lower()
+            hit = any(matches_identity(entry, user_id, user_name) for entry in entries)
+            if mode == "whitelist" and not hit:
+                return False, "不在用户白名单内"
+            if mode == "blacklist" and hit:
+                return False, "命中用户黑名单"
+
         return True, ""
+
+    def _warn_empty_list(self, key: str, label: str) -> None:
+        """名单开着但是空的：只提示一次，然后按「未配置」处理，不拦任何人。"""
+        if key in self._chat_list_warned:
+            return
+        self._chat_list_warned.add(key)
+        self.ctx.logger.warning(
+            "IIROSE %s 已启用但名单为空，本次按「未配置」处理（不拦截任何人）；"
+            "要生效请填入 UID 或用户名，或把 chat_list 里对应的开关关掉", label)
 
     def _describe_chat_list(self) -> str:
         chat = getattr(self._settings, "chat_list", None)
         if chat is None or not getattr(chat, "enabled", False):
-            return "未启用（所有人都能触发回复）"
-        mode = "白名单" if str(getattr(chat, "user_list_type", "")).lower() == "whitelist" else "黑名单"
-        users = len(list(getattr(chat, "user_list", []) or []))
-        banned = len(list(getattr(chat, "ban_user_list", []) or []))
-        text = f"{mode}模式，用户 {users} 条"
-        if banned:
-            text += f"，永久屏蔽 {banned} 条"
-        return text
+            return "总开关=关（所有人都能触发回复）"
+
+        def state(enabled_key: str, list_key: str, label: str) -> str:
+            if not getattr(chat, enabled_key, False):
+                return f"{label}=关"
+            mode = str(getattr(chat, f"{list_key.split('_list')[0]}_list_type", "")).lower()
+            mode_text = "白" if mode == "whitelist" else "黑"
+            count = len([x for x in (getattr(chat, list_key, []) or []) if str(x).strip()])
+            return f"{label}={mode_text}名单({count} 条)"
+
+        return "总开关=开 | " + " | ".join((
+            state("ban_user_enabled", "ban_user_list", "永久屏蔽"),
+            state("user_list_enabled", "user_list", "用户"),
+            state("room_list_enabled", "room_list", "房间"),
+        ))
 
     def _log_dropped_chat(self, user_id: str, user_name: str, reason: str) -> None:
         chat = getattr(self._settings, "chat_list", None)
@@ -1224,7 +1569,15 @@ class IIRoseAdapterPlugin(MaiBotPlugin):
             await self._mark_ready(f"服务端首个报文类型={kind}")
 
         if kind == "init":
-            self.ctx.logger.info("IIROSE 服务端数据包：%d 字符", len(value))
+            names = parse_room_directory(value)
+            if names:
+                self._room_names.update(names)
+                # 避免无限增长：只保留最近的 5000 条
+                while len(self._room_names) > 5000:
+                    self._room_names.pop(next(iter(self._room_names)))
+            self.ctx.logger.info(
+                "IIROSE 服务端数据包：%d 字符（解析出 %d 个房间名，当前房间=%s）",
+                len(value), len(names), self._describe_room(self._room_id) or "-")
             return
 
         if kind == "heartbeat":
@@ -1234,6 +1587,21 @@ class IIRoseAdapterPlugin(MaiBotPlugin):
                     await self._client.send("c")
             except Exception:
                 self.ctx.logger.debug("IIROSE 心跳回包失败", exc_info=True)
+            return
+
+        if kind == "room_move":
+            if value.startswith("m!"):
+                code = value[2:]
+                self.ctx.logger.warning(
+                    "IIROSE 切房被拒绝（错误码 %s%s），将按新房间直接重连",
+                    code, "：未提供房间密码" if code == "5" else "")
+            else:
+                self.ctx.logger.info("IIROSE 服务端已允许移动房间")
+            return
+
+        if kind == "room_password":
+            self.ctx.logger.info("IIROSE 房间密码校验结果: %s（%s）", value[2:],
+                                 "通过" if value[2:3] == "1" else "未通过")
             return
 
         if kind == "member":
@@ -1256,12 +1624,16 @@ class IIRoseAdapterPlugin(MaiBotPlugin):
                           self_name: str) -> list[Dict[str, Any]]:
         """把 IIROSE 的提及语法拆成 Host 标准组件。
 
-        ` [*用户名*] ` → at 组件（官方唯一的 @ 用户写法，两侧空格）
-        ` [_房间id_] `  → text 组件（@ 房间不是 @ 人，交给 Host 当普通文本）
-        ` [@uid@] `     → at 组件（官方没有这种写法，仅兼容旧数据）
+        对照官方 `decoder/core/clearMsg.ts` 的三条规则：
 
-        提及机器人自己时 target_user_id 用机器人身份 ID，Host 才能判定“我被 @ 了”；
-        提及别人时优先用本地用户目录把用户名换成真实 UID，查不到才退回用户名。
+        | IIROSE 写法 | 官方解析 | 这里交给 Host 的形式 |
+        |---|---|---|
+        | ` [*用户名*] ` | at（按用户名查用户） | `at` 组件，target_user_id 用查到的 UID |
+        | ` [@uid@] ` | at by id（按 UID 查用户） | `at` 组件，target_user_id 直接用该 UID |
+        | ` [_房间id_] ` | sharp（提及频道/房间） | 文本组件，渲染成**房间名**（Host 没有 sharp 概念） |
+
+        提及机器人自己时 target_user_id 用机器人身份 ID，Host 才能判定「我被 @ 了」；
+        提及别人时优先查本地用户目录把用户名换成真实 UID，查不到才退回用户名。
         """
         components: list[Dict[str, Any]] = []
         position = 0
@@ -1273,9 +1645,9 @@ class IIRoseAdapterPlugin(MaiBotPlugin):
 
             name, room_id, uid = (match.group(1), match.group(2), match.group(3))
             if name is not None:
-                name = name.strip()
+                name = decode_entities(name).strip()
                 if self_name and name == self_name:
-                    target_id = self_uid or name          # 让 Host 认出“被点名的是我”
+                    target_id = self_uid or name          # 让 Host 认出「被点名的是我」
                 else:
                     target_id = self._uid_for_name(name) or name
                 components.append({"type": "at", "data": {
@@ -1286,11 +1658,14 @@ class IIRoseAdapterPlugin(MaiBotPlugin):
                 uid = uid.strip()
                 components.append({"type": "at", "data": {
                     "target_user_id": uid,
+                    # 官方是 at-by-id：名字由客户端按 UID 反查，这里能查到就顺带给上
                     "target_user_nickname": self._name_for_uid(uid),
                 }})
             else:
-                # @ 房间：保留原样，避免 Host 把它当成“有人 @ 我”
-                components.append({"type": "text", "data": match.group(0)})
+                # @ 房间（官方叫 sharp）：不能当成「有人 @ 我」，渲染成房间名更好读
+                room_key = (room_id or "").strip()
+                label = self._room_name(room_key) or room_key
+                components.append({"type": "text", "data": f"[{label}]"})
             position = match.end()
 
         tail = text[position:]
@@ -1316,29 +1691,33 @@ class IIRoseAdapterPlugin(MaiBotPlugin):
         self._remember("", user_id=uid, user_name=name,
                        timestamp=int(event.get("timestamp") or 0), text="")
 
-        description = describe_member_event(event)
+        # 事件文案带上房间名：换房时「去了别的房间 → 放映社 (5b7ab80a2017d)」
+        label_room = (str(event.get("target_room_id") or "") if event.get("is_move")
+                      else (str(event.get("room_id") or "") or self._room_id))
+        description = describe_member_event(event, self._describe_room(label_room))
         self.ctx.logger.info(
             "IIROSE 成员事件: %s（event=%s join_type=%s uid=%s room=%s target=%s）",
             description, event.get("event"), event.get("join_type") or "-",
-            uid or "-", event.get("room_id") or "-", event.get("target_room_id") or "-")
+            uid or "-", self._describe_room(str(event.get("room_id") or "")) or "-",
+            self._describe_room(str(event.get("target_room_id") or "")) or "-")
 
         if not getattr(settings.bot, "report_member_events", True):
             return
         # 机器人自己的上下线没必要回灌给 Host，避免刷屏
-        if uid and uid == settings.account.uid:
+        if uid and uid == self._self_uid:
             return
 
         # group_id 必须与聊天消息用同一个（配置里的房间），否则 Host 会把成员事件
         # 当成另一个会话，麦麦的记忆/上下文就被劈成两半。
         record_room = str(event.get("room_id") or "")
-        room_id = settings.account.room_id or record_room
-        if record_room and settings.account.room_id and record_room != settings.account.room_id:
+        room_id = self._room_id or record_room
+        if record_room and self._room_id and record_room != self._room_id:
             key = f"member-room-mismatch:{record_room}"
             if key not in self._notice_warned:
                 self._notice_warned.add(key)
                 self.ctx.logger.info(
                     "IIROSE 成员事件里的房间=%s，按配置房间 %s 上报（保持与聊天同一会话）",
-                    record_room, settings.account.room_id)
+                    record_room, self._room_id)
 
         event_key = (f"{event.get('event')}:{event.get('join_type') or ''}:"
                      f"{uid}:{event.get('timestamp') or 0}")
@@ -1365,7 +1744,11 @@ class IIRoseAdapterPlugin(MaiBotPlugin):
             "display_message": description,
         }
         if room_id:
-            payload["message_info"]["group_info"] = {"group_id": room_id, "group_name": room_id}
+            payload["message_info"]["group_info"] = {
+                "group_id": room_id,
+                # 会话名用真实房间名，后台聊天列表才不会只显示一串房间号
+                "group_name": self._room_name(room_id) or room_id,
+            }
             payload["message_info"]["additional_config"]["platform_io_target_group_id"] = room_id
 
         route_metadata = {
@@ -1409,19 +1792,22 @@ class IIRoseAdapterPlugin(MaiBotPlugin):
         message_id = str(msg.get("message_id") or "")
         timestamp = int(msg.get("timestamp") or 0)
 
-        if settings.account.uid and user_id == settings.account.uid:
+        if self._self_uid and user_id == self._self_uid:
             return  # 机器人自己发的消息
         if not text.strip():
             return
-        if not message_id.isalnum():
-            self.ctx.logger.debug("IIROSE 跳过非标准消息: %s", str(msg.get("raw"))[:200])
+        # 消息 id 有两种形态：服务器生成的纯数字，以及客户端带 id 时的
+        # `<客户端id><服务器时间戳`（实测 `411952792881<1789271137`，自己的消息回显也是这种）。
+        # 之前用 isalnum() 判断，把后者整条丢掉了 —— 别人 @ 别人时麦麦会完全看不到。
+        if not any(ch.isdigit() for ch in message_id):
+            self.ctx.logger.debug("IIROSE 跳过没有消息 id 的记录: %s", str(msg.get("raw"))[:200])
             return
 
-        if not settings.account.uid and settings.account.username \
-                and user_name == settings.account.username:
+        if not self._self_uid and self._username \
+                and user_name == self._username:
             return  # uid 未配置时的兜底：按昵称过滤机器人自己发的消息
 
-        room_id = settings.account.room_id or str(msg.get("room_id") or "")
+        room_id = self._room_id or str(msg.get("room_id") or "")
 
         # 黑白名单：在投递给麦麦之前就拦掉，麦麦根本看不到这些消息
         allowed, reason = self._chat_list_check(kind, user_id, user_name, room_id)
@@ -1442,7 +1828,12 @@ class IIRoseAdapterPlugin(MaiBotPlugin):
             "additional_config": {},
         }
         if kind == "room":
-            message_info["group_info"] = {"group_id": room_id, "group_name": room_id}
+            # group_name 用真实房间名：后台聊天列表/会话名读的就是它，
+            # 之前两个字段都填房间号，所以界面上群聊显示不出名字。
+            message_info["group_info"] = {
+                "group_id": room_id,
+                "group_name": self._room_name(room_id) or room_id,
+            }
 
         route_metadata = {
             "self_id": self._account_id(),
@@ -1472,8 +1863,8 @@ class IIRoseAdapterPlugin(MaiBotPlugin):
         # 组件规范（对照官方 NapCat 适配器）：text → {"type":"text","data":str}
         #                                      at   → {"type":"at","data":{...}}
         canonical = self._build_components(visible,
-                                           self_uid=settings.account.uid,
-                                           self_name=settings.account.username)
+                                           self_uid=self._self_uid,
+                                           self_name=self._username)
         plain = [{"type": "text", "data": visible}]
         component_variants: list[list[Dict[str, Any]]] = [canonical]
         if canonical != plain:
@@ -1591,7 +1982,7 @@ class IIRoseAdapterPlugin(MaiBotPlugin):
             await client.send(raw)
             self.ctx.logger.info(
                 "IIROSE 已发送出站消息: type=%s target=%s len=%d（配置房间=%s）",
-                kind, target_id, len(text), settings.account.room_id or "-")
+                kind, target_id, len(text), self._room_id or "-")
         except Exception as exc:
             self.ctx.logger.warning("IIROSE 出站发送异常: %s", exc, exc_info=True)
             return {"success": False, "error": str(exc)}
@@ -1991,28 +2382,33 @@ class IIRoseAdapterPlugin(MaiBotPlugin):
         return ""
 
     def _resolve_reply(self, target_id: str, item_data: Mapping[str, Any]) -> tuple[str, str, str]:
-        """把 Host 的引用组件还原成 (旧正文, 发送者, 时间戳秒)。
+        """把 Host 的引用组件还原成 (旧正文, 发送者, **被引用消息的时间戳秒**)。
 
-        优先查本地近期消息缓存（回复的对象通常就在最近 200 条里）；
-        查不到时退回组件自带的昵称，时间戳用目标消息 id 占位。
+        标记里那个数字是**时间戳（秒）**，不是消息 id —— IIROSE 客户端会把它按日期渲染：
+        - 传 12 位随机消息 id（如 `828102986562`）→ 客户端显示成 **6088 年**这种离谱日期；
+        - 传 10 位秒级时间戳（如 `1789272020`）→ 正常显示。
+        官方 `PublicMessage.ts` 解析出来也是存进名为 `time` 的字段，
+        third-party.md 同样写作「发送者_时间戳秒」。
+        （`messages.md` 散文里那句「发送者_消息id」是文档误记，别照抄。）
+
+        时间戳只能从本地近期消息缓存里拿（Host 的 reply 组件只给消息 id）。
+        拿不到就**不发引用**，退化成普通文本——宁可少一个引用框，也不发一个错误日期。
         """
         cached = self._recent.get(target_id) if target_id else None
         if cached:
             who = str(cached.get("user_name") or "").strip()
             timestamp = str(cached.get("timestamp") or "").strip()
             quoted = str(cached.get("text") or "").strip()
-            if who and timestamp:
+            if who and timestamp.isdigit() and QUOTE_TS_MIN <= int(timestamp) <= QUOTE_TS_MAX:
                 return quoted, who, timestamp
+            if who:
+                self.ctx.logger.info(
+                    "IIROSE 引用的时间戳不合理（%s），按普通文本发送: %s",
+                    timestamp or "-", target_id or "-")
 
-        who = str(item_data.get("target_user_nickname")
-                  or item_data.get("target_user_cardname") or "").strip()
-        if who and target_id:
-            return "", who, target_id
-
-        # 还原不出来说明 Host 给的 target_message_id 和我们回传的消息 id 对不上，
-        # 把组件原文打出来，方便直接对齐字段名（不影响消息本身照常发出）。
+        # 缓存里没有（或时间戳异常）：组件自带的昵称也救不了时间戳，直接不引用
         self.ctx.logger.info(
-            "IIROSE 出站引用无法还原，按普通文本发送: target_message_id=%r 组件=%s 近期缓存=%d 条",
+            "IIROSE 出站引用无法还原时间戳，按普通文本发送: target_message_id=%r 组件=%s 近期缓存=%d 条",
             target_id or "-", json.dumps(dict(item_data), ensure_ascii=False)[:200],
             len(self._recent))
         return "", "", ""
@@ -2032,6 +2428,8 @@ class IIRoseAdapterPlugin(MaiBotPlugin):
 
         chunks: list[str] = []
         quote: tuple[str, str, str] = ("", "", "")
+        # 只要输出里出现过 @ / 房间提及标记，整体就不能再做 strip（见下方说明）
+        has_mention = False
         # (chunks 下标, 扩展名提示, base64) —— 上传成功后原地替换占位文本
         pending: list[tuple[int, str, str]] = []
 
@@ -2054,17 +2452,27 @@ class IIRoseAdapterPlugin(MaiBotPlugin):
 
             if ctype == "at":
                 item_data = data if isinstance(data, Mapping) else {}
-                name = str(item_data.get("target_user_cardname")
-                           or item_data.get("target_user_nickname")
-                           or self._component_text(data) or "").strip()
                 uid = str(item_data.get("target_user_id") or "").strip()
-                if not name and uid:
-                    # IIROSE 只支持按用户名 @，所以先查本地用户目录把 UID 换成用户名
-                    name = self._name_for_uid(uid)
+                # IIROSE 的 `[*名字*]` 只认「用户名」，必须和对方登录名完全一致才生效。
+                # Host 给的 cardname 是群名片、nickname 可能是备注，用它们发出去
+                # 会变成一段普通文字而不是真的 @。所以优先用本地目录里
+                # 从房间报文拿到的用户名（记录字段 2 就是用户名）。
+                name = self._name_for_uid(uid) if uid else ""
+                if not name:
+                    name = str(item_data.get("target_user_nickname")
+                               or self._component_text(data) or "").strip()
                 if name:
                     chunks.append(f" [*{name}*] ")       # 官方 @ 用户写法（两侧空格）
+                    has_mention = True
                 elif uid:
-                    chunks.append(f" [@{uid}@] ")        # 官方无此写法，仅作兜底
+                    # 查不到名字就退化成官方支持的 at-by-id（客户端按 UID 反查）
+                    chunks.append(f" [@{uid}@] ")
+                    has_mention = True
+                else:
+                    chunks.append(" " + str(
+                        item_data.get("target_user_cardname") or "").strip() + " ")
+                    self.ctx.logger.info(
+                        "IIROSE 出站 at 组件既没有 UID 也没有用户名，已降级为纯文本")
                 continue
 
             if ctype == "reply":
@@ -2109,7 +2517,13 @@ class IIRoseAdapterPlugin(MaiBotPlugin):
                 if isinstance(value, str) and value.strip():
                     return value.strip()
 
-        body = "".join(chunks).strip()
+        body = "".join(chunks)
+        if not has_mention:
+            # 只有纯文本时才去掉首尾空白。
+            # **一旦有 @ / 引用标记就不能 strip**：协议要求 `@用户` 写成 ` [*用户名*] `
+            # （两侧空格是语法的一部分），官方解析正则也是 `(\s+)(\[\*…\*\])(\s)`。
+            # 把前面的空格 strip 掉，接收端就认不出这是一个 @，只会显示成一段普通文字。
+            body = body.strip()
         if quote[1]:
             # 引用消息：`旧内容 (_hr) 发送者_时间戳秒 (hr_) 新内容`
             return format_quote(strip_mentions(quote[0]), quote[1], quote[2], body)
@@ -2149,7 +2563,7 @@ class IIRoseAdapterPlugin(MaiBotPlugin):
 
         chat_type = str(route.get("chat_type") or "").lower()
         if group_id or chat_type == "group":
-            if group_id and settings.account.room_id and group_id != settings.account.room_id:
+            if group_id and self._room_id and group_id != self._room_id:
                 # Host 回传的是它自己的会话 id；房间消息报文不带房间号，
                 # 所以一律按配置房间发送（只提示一次，避免刷屏）。
                 key = f"group-mismatch:{group_id}"
@@ -2157,11 +2571,11 @@ class IIRoseAdapterPlugin(MaiBotPlugin):
                     self._notice_warned.add(key)
                     self.ctx.logger.info(
                         "IIROSE 出站目标：Host 的 group_id=%s，实际按配置房间 %s 发送"
-                        "（房间消息报文本身不含房间号）", group_id, settings.account.room_id)
-            return "room", settings.account.room_id or group_id
+                        "（房间消息报文本身不含房间号）", group_id, self._room_id)
+            return "room", self._room_id or group_id
         if user_id or route_target_user:
             return "private", user_id or route_target_user
-        return "room", settings.account.room_id
+        return "room", self._room_id
 
 
 def create_plugin() -> IIRoseAdapterPlugin:
