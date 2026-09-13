@@ -1,0 +1,33 @@
+{
+  "manifest_version": 2,
+  "id": "community.iirose-adapter",
+  "version": "0.2.0",
+  "name": "IIROSE 适配器",
+  "description": "插件版 IIROSE（蔷薇花园）适配器，通过 WebSocket 直连实现消息收发。",
+  "author": {
+    "name": "TYC3301-1162-1",
+    "url": "https://github.com/TYC3301-1162-1/Maibot-for-iirose-demo"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/TYC3301-1162-1/Maibot-for-iirose-demo",
+    "homepage": "https://github.com/TYC3301-1162-1/Maibot-for-iirose-demo",
+    "documentation": "https://iirose-plugins.github.io/iirose-plugins-docs/",
+    "issues": "https://github.com/TYC3301-1162-1/Maibot-for-iirose-demo/issues"
+  },
+  "host_application": {
+    "min_version": "1.2.0",
+    "max_version": "1.2.99"
+  },
+  "sdk": {
+    "min_version": "2.5.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [],
+  "capabilities": [],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": ["zh-CN"]
+  },
+  "plugin_type": "adapter"
+}
