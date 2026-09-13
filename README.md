@@ -66,7 +66,7 @@ git clone https://github.com/TYC3301-1162-1/Maibot-For-iirose-Adapter-Demo MaiBo
 | `username` | `""` | 机器人用户名，不带 `[* *]` |
 | `uid` | `""` | **13 位唯一标识**，强烈建议填写（见下方说明） |
 | `password` | `""` | 账号密码（仅本地用于计算 MD5） |
-| `room_id` | `""` | 初始房间 ID，例如 `16a7c38409e902`。**改这里会实时切房** |
+| `room_id` | `""` | 初始房间 ID，例如 `房间号`。**改这里会实时切房** |
 | `room_password` | `""` | 房间密码，一般留空 |
 
 **UID 怎么拿**：登录 IIROSE 客户端 → 左侧菜单 → 个人资料 → 复制「唯一标识」。
@@ -192,7 +192,7 @@ docker logs maim-bot-core -f | grep -iE "iirose"
 期望看到：
 
 ```
-IIROSE 适配器已启动连接任务（账号=03酱 房间=16a7c38409e902 保活=30s 停滞重连=120s 退避上限=300s 聊天名单：总开关=关（所有人都能触发回复））
+IIROSE 适配器已启动连接任务（账号=[你的机器人名称] 房间=[房间号] 保活=30s 停滞重连=120s 退避上限=300s 聊天名单：总开关=关（所有人都能触发回复））
 IIROSE 选定服务器 wss://m8.iirose.com:8778 (xxx ms)
 IIROSE 已连接 wss://m8.iirose.com:8778
 IIROSE 登录报文已发送，等待服务端数据 …
@@ -227,11 +227,11 @@ hello_on_login = true
 在 WebUI / `config.toml` 里改了 `[account] room_id` 后，不需要手动重启：
 
 ```
-IIROSE 房间配置变更：64d5f8e17b2ad → 5b7ab80a2017d，执行切房
-IIROSE 切房指令已发送（m5b7ab80a2017d），1.5s 后断开并按新房间重连
+IIROSE 房间配置变更：[房间1] → [房间2]，执行切房
+IIROSE 切房指令已发送，1.5s 后断开并按新房间重连
 IIROSE 服务端已允许移动房间
-IIROSE 登录报文已发送（切房重连：64d5f8e17b2ad → 5b7ab80a2017d），等待服务端数据 …
-IIROSE 已切换到新房间 5b7ab80a2017d（原房间 64d5f8e17b2ad）
+IIROSE 登录报文已发送（切房重连：[房间1] → [房间2]），等待服务端数据 …
+IIROSE 已切换到新房间 [房间2]（原房间 [房间1]）
 ```
 
 流程按协议走：**先发移动包 `m<新房间>`（密码房先发 `=^~<新房间>><密码>` 验密码）→ 断开 WS → 重新发登录包，`r` 指向新房间并带上 `lr`（原房间 id）**。
